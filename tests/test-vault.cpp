@@ -8,7 +8,7 @@ using namespace jgaa::safekeeping;
 constexpr auto vault = SafeKeeping::Vault::DEFAULT_SECURE_STORAGE;
 
 // Test Fixture for SafeKeeping
-class TestFileStorage : public ::testing::Test {
+class TestVault : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create an instance using the factory method
@@ -48,7 +48,7 @@ protected:
 };
 
 // Test storing and retrieving a simple string (e.g., password)
-TEST_F(TestFileStorage, StoreAndRetrievePassword) {
+TEST_F(TestVault, StoreAndRetrievePassword) {
     std::string key = "user_password";
     std::string password = "SuperSecret123!";
 
@@ -60,7 +60,7 @@ TEST_F(TestFileStorage, StoreAndRetrievePassword) {
 }
 
 // Test storing and retrieving a PEM-encoded certificate
-TEST_F(TestFileStorage, StoreAndRetrievePEMCertificate) {
+TEST_F(TestVault, StoreAndRetrievePEMCertificate) {
     std::string key = "server_cert";
     std::string pemCert = R"(-----BEGIN CERTIFICATE-----
 MIIE7zCCAtcCFGBr8HLCF8m3FO8r8L6bW3Qsmq3xMA0GCSqGSIb3DQEBCwUAMDQx
@@ -101,7 +101,7 @@ PJ2RLcmxJHWiXpzbU0w7YSnGHg==
 }
 
 // Test storing and retrieving a JSON payload containing URLs and certificates
-TEST_F(TestFileStorage, StoreAndRetrieveJSONPayload) {
+TEST_F(TestVault, StoreAndRetrieveJSONPayload) {
     std::string key = "json_payload";
     std::string jsonPayload = R"({
         "certificate": "-----BEGIN CERTIFICATE-----
@@ -198,7 +198,7 @@ qTKcjLQ+PkXZ5jrj2/6WtgozKmEdeA==
 }
 
 // Test removing a secret
-TEST_F(TestFileStorage, RemoveSecret) {
+TEST_F(TestVault, RemoveSecret) {
     std::string key = "removable_secret";
     std::string value = "TemporaryValue";
 
@@ -213,7 +213,7 @@ TEST_F(TestFileStorage, RemoveSecret) {
 }
 
 // Test retrieving a non-existent key
-TEST_F(TestFileStorage, RetrieveNonExistentKey) {
+TEST_F(TestVault, RetrieveNonExistentKey) {
     std::string key = "non_existent_key";
     safeKeeping->removeSecret(key);
 
@@ -222,7 +222,7 @@ TEST_F(TestFileStorage, RetrieveNonExistentKey) {
 }
 
 // Test removing a non-existent key
-TEST_F(TestFileStorage, RemoveNonExistentKey) {
+TEST_F(TestVault, RemoveNonExistentKey) {
     std::string key = "non_existent_key";
     safeKeeping->removeSecret(key);  // Ensure it's not there
 
@@ -230,7 +230,7 @@ TEST_F(TestFileStorage, RemoveNonExistentKey) {
 }
 
 // Test storing a secret with a description and retrieving it
-TEST_F(TestFileStorage, StoreAndRetrieveSecretWithDescription) {
+TEST_F(TestVault, StoreAndRetrieveSecretWithDescription) {
     std::string key = "api_key";
     std::string secret = "API_SECRET_123";
     std::string description = "API Key for Service X";
@@ -243,7 +243,7 @@ TEST_F(TestFileStorage, StoreAndRetrieveSecretWithDescription) {
 }
 
 // Test listing stored secrets with descriptions
-TEST_F(TestFileStorage, ListSecretsWithDescription) {
+TEST_F(TestVault, ListSecretsWithDescription) {
     safeKeeping->removeSecret("key1");
     safeKeeping->removeSecret("key2");
 
@@ -267,7 +267,7 @@ TEST_F(TestFileStorage, ListSecretsWithDescription) {
 }
 
 // Test that only secrets stored with a description appear in `listSecrets()`
-TEST_F(TestFileStorage, ListSecretsOnlyShowsDescribedSecrets) {
+TEST_F(TestVault, ListSecretsOnlyShowsDescribedSecrets) {
     std::string key1 = "described_key";
     std::string key2 = "undisclosed_key";
     std::string secret1 = "SecretWithDesc";
@@ -336,7 +336,7 @@ TEST(TestSafeKeeping, NamespaceIsolation) {
 }
 
 // Test removing a secret with description
-TEST_F(TestFileStorage, RemoveSecretWithDescription) {
+TEST_F(TestVault, RemoveSecretWithDescription) {
     std::string key = "remove_me";
     std::string secret = "TemporarySecret";
     std::string description = "Temporary Description";
