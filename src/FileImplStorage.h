@@ -36,6 +36,7 @@ public:
     }
 
     bool removeSecret(const std::string& key) override {
+        removeDescription(key);
         return std::filesystem::remove(path_ / key);
     }
 

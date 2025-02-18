@@ -5,12 +5,14 @@
 
 using namespace jgaa::safekeeping;
 
+constexpr auto vault = SafeKeeping::Vault::INSECURE_FILE;
+
 // Test Fixture for SafeKeeping
 class TestFileStorage : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create an instance using the factory method
-        safeKeeping = SafeKeeping::create("TestSafe", true);
+        safeKeeping = SafeKeeping::create("TestSafe", vault);
         ASSERT_NE(safeKeeping, nullptr);  // Ensure creation was successful
 
         // Clear the list of stored keys before each test
@@ -25,6 +27,12 @@ protected:
     void storeAndTrackSecret(const std::string& key, const std::string& value) {
         safeKeeping->removeSecret(key);  // Ensure the key does not exist before adding
         ASSERT_TRUE(safeKeeping->storeSecret(key, value));
+        storedKeys.insert(key);
+    }
+
+    void storeAndTrackSecretWithDescription(const std::string& key, const std::string& value, const std::string& description) {
+        safeKeeping->removeSecret(key);  // Ensure the key does not exist before adding
+        ASSERT_TRUE(safeKeeping->storeSecretWithDescription(key, value, description));
         storedKeys.insert(key);
     }
 
@@ -220,3 +228,107 @@ TEST_F(TestFileStorage, RemoveNonExistentKey) {
 
     EXPECT_FALSE(safeKeeping->removeSecret(key));  // Should return false
 }
+
+// Test storing a secret with a description and retrieving it
+TEST_F(TestFileStorage, StoreAndRetrieveSecretWithDescription) {
+    std::string key = "api_key";
+    std::string secret = "API_SECRET_123";
+    std::string description = "API Key for Service X";
+
+    storeAndTrackSecretWithDescription(key, secret, description);
+
+    auto retrieved = safeKeeping->retrieveSecret(key);
+    ASSERT_TRUE(retrieved.has_value());
+    EXPECT_EQ(retrieved.value(), secret);
+}
+
+// Test listing stored secrets with descriptions
+TEST_F(TestFileStorage, ListSecretsWithDescription) {
+    safeKeeping->removeSecret("key1");
+    safeKeeping->removeSecret("key2");
+
+    std::string key1 = "key1";
+    std::string secret1 = "password123";
+    std::string desc1 = "Login password";
+
+    std::string key2 = "key2";
+    std::string secret2 = "myToken456";
+    std::string desc2 = "API token for user";
+
+    storeAndTrackSecretWithDescription(key1, secret1, desc1);
+    storeAndTrackSecretWithDescription(key2, secret2, desc2);
+
+    auto secrets = safeKeeping->listSecrets();
+    ASSERT_EQ(secrets.size(), 2);
+    EXPECT_EQ(secrets[0].name, key1);
+    EXPECT_EQ(secrets[0].description, desc1);
+    EXPECT_EQ(secrets[1].name, key2);
+    EXPECT_EQ(secrets[1].description, desc2);
+}
+
+// Test that only secrets stored with a description appear in `listSecrets()`
+TEST_F(TestFileStorage, ListSecretsOnlyShowsDescribedSecrets) {
+    std::string key1 = "described_key";
+    std::string key2 = "undisclosed_key";
+    std::string secret1 = "SecretWithDesc";
+    std::string secret2 = "SecretWithoutDesc";
+    std::string description = "A described secret";
+
+    storeAndTrackSecretWithDescription(key1, secret1, description);
+    storeAndTrackSecret(key2, secret2);  // No description added
+
+    auto secrets = safeKeeping->listSecrets();
+    ASSERT_EQ(secrets.size(), 1);
+    EXPECT_EQ(secrets[0].name, key1);
+    EXPECT_EQ(secrets[0].description, description);
+}
+
+// Test that two different namespaces do not interfere with each other
+TEST(TestSafeKeeping, NamespaceIsolation) {
+    auto vault1 = SafeKeeping::create("Namespace1", vault);
+    auto vault2 = SafeKeeping::create("Namespace2", vault);
+
+    ASSERT_NE(vault1, nullptr);
+    ASSERT_NE(vault2, nullptr);
+
+    // Store a secret in vault1
+    std::string key = "shared_key";
+    std::string secret1 = "Vault1_Secret";
+    std::string secret2 = "Vault2_Secret";
+
+    ASSERT_TRUE(vault1->storeSecret(key, secret1));
+    ASSERT_TRUE(vault2->storeSecret(key, secret2));
+
+    // Verify vault1 retrieves its own secret
+    auto retrieved1 = vault1->retrieveSecret(key);
+    ASSERT_TRUE(retrieved1.has_value());
+    EXPECT_EQ(retrieved1.value(), secret1);
+
+    // Verify vault2 retrieves its own secret
+    auto retrieved2 = vault2->retrieveSecret(key);
+    ASSERT_TRUE(retrieved2.has_value());
+    EXPECT_EQ(retrieved2.value(), secret2);
+
+    // Cleanup
+    vault1->removeSecret(key);
+    vault2->removeSecret(key);
+}
+
+// Test removing a secret with description
+TEST_F(TestFileStorage, RemoveSecretWithDescription) {
+    std::string key = "remove_me";
+    std::string secret = "TemporarySecret";
+    std::string description = "Temporary Description";
+
+    storeAndTrackSecretWithDescription(key, secret, description);
+    ASSERT_TRUE(safeKeeping->removeSecret(key));
+
+    auto retrieved = safeKeeping->retrieveSecret(key);
+    EXPECT_FALSE(retrieved.has_value());
+
+    auto secrets = safeKeeping->listSecrets();
+    EXPECT_TRUE(secrets.empty());
+
+    storedKeys.erase(key);
+}
+

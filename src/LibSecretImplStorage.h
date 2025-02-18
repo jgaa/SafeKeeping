@@ -74,6 +74,7 @@ public:
             }
         };
 
+        removeDescription(key);
         return secret_password_clear_sync(
             &schema,
             nullptr,  // GCancellable
