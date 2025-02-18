@@ -3,6 +3,7 @@
 #include "safekeeping/SafeKeeping.h"
 #include <libsecret/secret.h>
 #include <string>
+#include <iostream>
 
 namespace jgaa::safekeeping {
 
@@ -30,10 +31,11 @@ public:
             secret.c_str(),
             nullptr,  // GCancellable
             nullptr,  // GError**
-            "key", key.c_str(),
+            "key", namespacedKey.c_str(),
             nullptr
             );
     }
+
 
     std::optional<std::string> retrieveSecret(const std::string& key) override {
         std::string namespacedKey = name() + "/" + key;
@@ -51,7 +53,7 @@ public:
             &schema,
             nullptr,  // GCancellable
             nullptr,  // GError**
-            "key", key.c_str(),
+            "key", namespacedKey.c_str(),
             nullptr
             );
 
@@ -79,10 +81,11 @@ public:
             &schema,
             nullptr,  // GCancellable
             nullptr,  // GError**
-            "key", key.c_str(),
+            "key", namespacedKey.c_str(),
             nullptr
             );
     }
+
 };
 
 } // namespace jgaa::safekeeping

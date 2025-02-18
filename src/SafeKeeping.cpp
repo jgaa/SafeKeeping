@@ -43,7 +43,7 @@ std::filesystem::path getSafeKeepingPath(const std::string &name) {
 void preparePrivateDir() {
     auto path = getHome() / ".local" / "share" / "safekeeping";
     if (!std::filesystem::exists(path) && path.has_parent_path() && filesystem::exists(path.parent_path())) {
-#ifdef WIN32
+#ifdef _WIN32
         static_assert(false, "Implement me");
 #else
         // Create using POSIX calls. Set permissions to user only
@@ -61,8 +61,6 @@ void preparePrivateDir() {
 
 void validateKey(string_view key) {
     static const regex validKey{R"(^[a-zA-Z0-9_-]+$)"};
-
-    cout << "Validating key: '" << key << "'" << endl;
 
     if (!regex_match(key.begin(), key.end(), validKey)) {
         throw invalid_argument{"Invalid key. Must consist of Latin letters, digits, hyphen and underscore"};
@@ -190,7 +188,6 @@ bool SafeKeeping::loadDescriptions()
 {
     list_.clear();
 
-    // Check if the info_path_ file exists
     if (!std::filesystem::exists(info_path_)) {
         return false;
     }
@@ -205,7 +202,9 @@ bool SafeKeeping::loadDescriptions()
         std::istringstream ss(line);
         std::string name, description;
 
-        if (std::getline(ss, name, '|') && std::getline(ss, description)) {
+        if (std::getline(ss, name, '|')) {
+            // If no description exists after '|', assign an empty string
+            std::getline(ss, description);
             list_.push_back({name, description});
         }
     }

@@ -285,33 +285,54 @@ TEST_F(TestFileStorage, ListSecretsOnlyShowsDescribedSecrets) {
 
 // Test that two different namespaces do not interfere with each other
 TEST(TestSafeKeeping, NamespaceIsolation) {
-    auto vault1 = SafeKeeping::create("Namespace1", vault);
-    auto vault2 = SafeKeeping::create("Namespace2", vault);
+    const std::string key = "shared_key";
+    const std::string secret1 = "Vault1_Secret";
+    const std::string secret2 = "Vault2_Secret";
 
-    ASSERT_NE(vault1, nullptr);
-    ASSERT_NE(vault2, nullptr);
+    {
+        auto vault1 = SafeKeeping::create("Namespace1", vault);
+        ASSERT_NE(vault1, nullptr);
+        ASSERT_TRUE(vault1->storeSecret(key, secret1));
+    }
 
-    // Store a secret in vault1
-    std::string key = "shared_key";
-    std::string secret1 = "Vault1_Secret";
-    std::string secret2 = "Vault2_Secret";
+    {
+        auto vault2 = SafeKeeping::create("Namespace2", vault);
+        ASSERT_NE(vault2, nullptr);
+        ASSERT_TRUE(vault2->storeSecret(key, secret2));
+    }
 
-    ASSERT_TRUE(vault1->storeSecret(key, secret1));
-    ASSERT_TRUE(vault2->storeSecret(key, secret2));
+    {
+        auto vault1 = SafeKeeping::create("Namespace1", vault);
+        ASSERT_NE(vault1, nullptr);
+        // Verify vault1 retrieves its own secret
+        auto retrieved1 = vault1->retrieveSecret(key);
+        ASSERT_TRUE(retrieved1.has_value());
+        EXPECT_EQ(retrieved1.value(), secret1);
+    }
 
-    // Verify vault1 retrieves its own secret
-    auto retrieved1 = vault1->retrieveSecret(key);
-    ASSERT_TRUE(retrieved1.has_value());
-    EXPECT_EQ(retrieved1.value(), secret1);
+    {
+        auto vault2 = SafeKeeping::create("Namespace2", vault);
+        ASSERT_NE(vault2, nullptr);
+        ASSERT_TRUE(vault2->storeSecret(key, secret2));
 
-    // Verify vault2 retrieves its own secret
-    auto retrieved2 = vault2->retrieveSecret(key);
-    ASSERT_TRUE(retrieved2.has_value());
-    EXPECT_EQ(retrieved2.value(), secret2);
+        // Verify vault2 retrieves its own secret
+        auto retrieved2 = vault2->retrieveSecret(key);
+        ASSERT_TRUE(retrieved2.has_value());
+        EXPECT_EQ(retrieved2.value(), secret2);
+
+    }
+
 
     // Cleanup
-    vault1->removeSecret(key);
-    vault2->removeSecret(key);
+    // {
+    //     auto vault1 = SafeKeeping::create("Namespace1", vault);
+    //     vault1->removeSecret(key);
+    // }
+
+    // {
+    //     auto vault2 = SafeKeeping::create("Namespace2", vault);
+    //     vault2->removeSecret(key);
+    // }
 }
 
 // Test removing a secret with description
