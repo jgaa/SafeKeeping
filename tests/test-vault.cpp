@@ -324,15 +324,15 @@ TEST(TestSafeKeeping, NamespaceIsolation) {
 
 
     // Cleanup
-    // {
-    //     auto vault1 = SafeKeeping::create("Namespace1", vault);
-    //     vault1->removeSecret(key);
-    // }
+    {
+        auto vault1 = SafeKeeping::create("Namespace1", vault);
+        vault1->removeSecret(key);
+    }
 
-    // {
-    //     auto vault2 = SafeKeeping::create("Namespace2", vault);
-    //     vault2->removeSecret(key);
-    // }
+    {
+        auto vault2 = SafeKeeping::create("Namespace2", vault);
+        vault2->removeSecret(key);
+    }
 }
 
 // Test removing a secret with description
