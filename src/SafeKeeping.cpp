@@ -5,6 +5,11 @@
 #include <algorithm>
 #include <iostream>
 
+// Include if the file exists
+#if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
+#   include <sys/stat.h>
+#endif
+
 #include "safekeeping/SafeKeeping.h"
 #include "FileImplStorage.h"
 
@@ -16,7 +21,8 @@
 #include "LibSecretImplStorage.h"
 #endif
 
-using namespace std;
+using namespace ::std;
+using namespace ::std::string_literals;
 
 namespace jgaa::safekeeping {
 
@@ -32,6 +38,25 @@ std::filesystem::path getHome() {
 
 std::filesystem::path getSafeKeepingPath(const std::string &name) {
     return getHome() / ".local" / "share" / "safekeeping" / name;
+}
+
+void preparePrivateDir() {
+    auto path = getHome() / ".local" / "share" / "safekeeping";
+    if (!std::filesystem::exists(path) && path.has_parent_path() && filesystem::exists(path.parent_path())) {
+#ifdef WIN32
+        static_assert(false, "Implement me");
+#else
+        // Create using POSIX calls. Set permissions to user only
+        // This set the permissions when the directory is created, preventing
+        // a potential attack where a malicious user tries to gain access to the
+        // directory before the permissions are set.
+        if (mkdir(path.c_str(), 0700) == -1) {
+            auto err = errno;
+            throw runtime_error{"Failed to create directory {}"s + path.string()
+                                + ". Error #" + to_string(err)};
+        }
+#endif
+    }
 }
 
 void validateKey(string_view key) {
@@ -73,10 +98,18 @@ SafeKeeping::SafeKeeping(std::string name)
     , info_path_{getSafeKeepingPath(name_) / "info.dat"}
 {
 
-    auto path = getSafeKeepingPath(name_);
+    const auto path = getSafeKeepingPath(name_);
+    preparePrivateDir();
 
     if (!std::filesystem::exists(path)) {
         std::filesystem::create_directories(path);
+
+        std::filesystem::permissions(
+            path,
+            std::filesystem::perms::owner_read |
+                std::filesystem::perms::owner_write |
+                std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace);
     }
 
     loadDescriptions();
@@ -120,12 +153,31 @@ SafeKeeping::info_list_t SafeKeeping::listSecrets() const
 
 void SafeKeeping::storeDescriptions()
 {
-    std::filesystem::create_directories(info_path_.parent_path());
+    if (list_.empty() && std::filesystem::exists(info_path_)) {
+        std::filesystem::remove(info_path_);
+        return;
+    };
 
-    std::ofstream file(info_path_, std::ios::out);
+    const auto parent_path = info_path_.parent_path();
+    if (!std::filesystem::exists(parent_path)) {
+        std::filesystem::create_directories(info_path_.parent_path());
+        std::filesystem::permissions(
+            parent_path,
+            std::filesystem::perms::owner_read |
+                std::filesystem::perms::owner_write |
+                std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace);
+    }
+
+    std::ofstream file(info_path_, std::ios::out | std::ios::trunc);
     if (!file) {
         throw std::runtime_error("Failed to open file for writing.");
     }
+
+    std::filesystem::permissions(
+        info_path_,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,  // Only user read/write
+        std::filesystem::perm_options::replace);
 
     ranges::sort(list_, {}, &Info::name);
 
