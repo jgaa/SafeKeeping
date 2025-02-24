@@ -25,7 +25,7 @@ working with both **KDE (KWallet)** and **GNOME Keyring**.
 | **Linux (KDE)**   | ✅ Works with KWallet (KDE Desktop)|
 | **Linux (GNOME)** | ✅ Works with GNOME Keyring (Gnome Desktop) |
 | **macOS**         | ❌ Not yet tested (Keychain Services) |
-| **Windows 10**    | ❌ Not yet tested (Credential Manager) |
+| **Windows 10**    | ✅ Works (Credential Manager) |
 | **Windows 11**    | ❌ Not yet tested (Credential Manager) |
 
 ## **Requirements**

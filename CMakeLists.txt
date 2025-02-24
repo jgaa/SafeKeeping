@@ -57,5 +57,6 @@ install(FILES
 install(TARGETS safekeeping LIBRARY DESTINATION lib)
 
 if (SAFEKEEPING_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(tests)
 endif()

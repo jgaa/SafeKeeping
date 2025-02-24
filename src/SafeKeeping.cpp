@@ -14,7 +14,10 @@
 #include "FileImplStorage.h"
 
 #ifdef _WIN32
-#include "WinSecretStorage.h"
+#include <windows.h>
+#include <ShlObj.h> // For SHGetFolderPath
+#include <Aclapi.h> // For EXPLICIT_ACCESSA and related functions
+#include "WinImplStorage.h"
 #elif __APPLE__
 #include "MacSecretStorage.h"
 #else
@@ -29,11 +32,19 @@ namespace jgaa::safekeeping {
 namespace {
 
 std::filesystem::path getHome() {
+#ifdef _WIN32
+    char home[MAX_PATH]{};
+    if (SHGetFolderPathA(NULL, CSIDL_PROFILE, NULL, 0, home) != S_OK) {
+        throw std::runtime_error{ "Failed to get home directory" };
+    }
+    return home;
+#else
     auto home = getenv("HOME");
     if (home == nullptr) {
         throw runtime_error{"HOME environment variable not set"};
     }
     return home;
+#endif
 }
 
 std::filesystem::path getSafeKeepingPath(const std::string &name) {
@@ -44,7 +55,51 @@ void preparePrivateDir() {
     auto path = getHome() / ".local" / "share" / "safekeeping";
     if (!std::filesystem::exists(path) && path.has_parent_path() && filesystem::exists(path.parent_path())) {
 #ifdef _WIN32
-        static_assert(false, "Implement me");
+        // Create the directory
+        if (!CreateDirectoryA(path.string().c_str(), NULL)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_ALREADY_EXISTS) {
+                throw std::runtime_error{ "Failed to create directory " + path.string() + ". Error #" + std::to_string(error) };
+            }
+        }
+
+        // RAII wrapper for LocalFree
+        auto localFreeDeleter = [](void* ptr) { if (ptr) LocalFree(ptr); };
+        std::unique_ptr<void, decltype(localFreeDeleter)> pSD(LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH), localFreeDeleter);
+        if (!pSD) {
+            throw std::runtime_error{ "Failed to allocate security descriptor" };
+        }
+
+        if (!InitializeSecurityDescriptor(pSD.get(), SECURITY_DESCRIPTOR_REVISION)) {
+            throw std::runtime_error{ "Failed to initialize security descriptor" };
+        }
+
+        // Add a DACL to the security descriptor
+        char current_user [] = "CURRENT_USER";
+        EXPLICIT_ACCESSA ea;
+        ZeroMemory(&ea, sizeof(EXPLICIT_ACCESSA));
+        ea.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE;
+        ea.grfAccessMode = SET_ACCESS;
+        ea.grfInheritance = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        ea.Trustee.ptstrName = current_user;
+
+        PACL pACL = NULL;
+        DWORD dwRes = SetEntriesInAclA(1, &ea, NULL, &pACL);
+        std::unique_ptr<void, decltype(localFreeDeleter)> pACLPtr(pACL, localFreeDeleter);
+        if (dwRes != ERROR_SUCCESS) {
+            throw std::runtime_error{ "Failed to set entries in ACL. Error #" + std::to_string(dwRes) };
+        }
+
+        if (!SetSecurityDescriptorDacl(pSD.get(), TRUE, pACL, FALSE)) {
+            throw std::runtime_error{ "Failed to set security descriptor DACL" };
+        }
+
+        if (!SetFileSecurityA(path.string().c_str(), DACL_SECURITY_INFORMATION, pSD.get())) {
+            throw std::runtime_error{ "Failed to set file security" };
+        }
+
 #else
         // Create using POSIX calls. Set permissions to user only
         // This set the permissions when the directory is created, preventing
@@ -116,7 +171,7 @@ SafeKeeping::SafeKeeping(std::string name)
 std::unique_ptr<SafeKeeping> SafeKeeping::create(std::string name, Vault vault) {
     if (vault == Vault::DEFAULT_SECURE_STORAGE) {
 #ifdef _WIN32
-        return std::make_unique<WinSecretStorage>(appName);
+        return std::make_unique<WinSafeKeeping>(name);
 #elif __APPLE__
         return std::make_unique<MacSecretStorage>(appName);
 #else // Linux
