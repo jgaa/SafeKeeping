@@ -26,7 +26,9 @@ working with both **KDE (KWallet)** and **GNOME Keyring**.
 | **Linux (GNOME)** | ✅ Works with GNOME Keyring (Gnome Desktop) |
 | **macOS**         | ❌ Not yet tested (Keychain Services) |
 | **Windows 10**    | ✅ Works (Credential Manager) |
-| **Windows 11**    | ❌ Not yet tested (Credential Manager) |
+| **Windows 11**    | ✅ Works (Credential Manager) |
+
+*Please note*: Windows Credential Manager has a 512 byte limit on its secrets, so we can't store a full PEM encoded 4096 bits X509 cert and it's key there. The test that does this is disabled under Windows. 
 
 ## **Requirements**
 - **C++20** compatible compiler
