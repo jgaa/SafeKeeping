@@ -22,8 +22,8 @@ working with both **KDE (KWallet)** and **GNOME Keyring**.
 
 | Platform        | Status       |
 |----------------|-------------|
-| **Linux (KDE)**   | ✅ Works with KWallet |
-| **Linux (GNOME)** | ❌ Not yet tested with GNOME Keyring |
+| **Linux (KDE)**   | ✅ Works with KWallet (KDE Desktop)|
+| **Linux (GNOME)** | ✅ Works with GNOME Keyring (Gnome Desktop) |
 | **macOS**         | ❌ Not yet tested (Keychain Services) |
 | **Windows 10**    | ❌ Not yet tested (Credential Manager) |
 | **Windows 11**    | ❌ Not yet tested (Credential Manager) |
@@ -33,5 +33,5 @@ working with both **KDE (KWallet)** and **GNOME Keyring**.
 - **CMake** (for building)
 
 ## **Dependencies**
-📌 **Linux:** `libsecret-1-dev` (for GNOME & KDE support)
+📌 **Linux:** `libsecret-1-dev pkgconf libgtest-dev` (for GNOME & KDE support)
 
