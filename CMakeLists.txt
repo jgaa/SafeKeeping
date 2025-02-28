@@ -29,10 +29,15 @@ if(WIN32)
     target_compile_definitions(safekeeping PRIVATE USE_WIN_SECRET_STORAGE)
     target_link_libraries(safekeeping PRIVATE Advapi32)
 elseif(APPLE)
-    message(STATUS "Building for macOS: Enabling Keychain Services")
+    message(STATUS "Building for macOS: Enabling Keychain Services ")
     target_sources(safekeeping PRIVATE src/MacImplStorage.h)
     target_compile_definitions(safekeeping PRIVATE USE_MAC_SECRET_STORAGE)
-    target_link_libraries(safekeeping PRIVATE "-framework Security")
+    target_link_libraries(safekeeping
+        PRIVATE
+            "-framework Security"
+            "-framework CoreFoundation"
+    )
+
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
 

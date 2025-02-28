@@ -27,7 +27,7 @@ add_executable(test_filestorage test-filestorage.cpp)
 target_link_libraries(test_filestorage PRIVATE safekeeping GTest::GTest GTest::Main Threads::Threads)
 
 # Add the test to CTest
-add_test(NAME TestFileStorage COMMAND test-filestorage)
+add_test(NAME TestFileStorage COMMAND test_filestorage)
 
 
 include(GoogleTest)

@@ -284,7 +284,7 @@ TEST_F(TestFileStorage, ListSecretsOnlyShowsDescribedSecrets) {
 }
 
 // Test that two different namespaces do not interfere with each other
-TEST(TestSafeKeeping, NamespaceIsolation) {
+TEST(TestFileStorageNsi, NamespaceIsolation) {
     auto vault1 = SafeKeeping::create("Namespace1", vault);
     auto vault2 = SafeKeeping::create("Namespace2", vault);
 

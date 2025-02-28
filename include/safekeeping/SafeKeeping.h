@@ -63,6 +63,10 @@ public:
         return name_;
     }
 
+    const std::string& nsName() const noexcept {
+        return ns_name_;
+    }
+
     /*! Stores the secret and associates a description with it.
      * \param key The key to store the secret under
      * \param secret The secret to store
@@ -90,6 +94,7 @@ private:
     bool loadDescriptions();
 
     std::string name_;
+    std::string ns_name_;
     std::filesystem::path info_path_;
     info_list_t list_;
 };

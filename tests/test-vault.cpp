@@ -290,7 +290,7 @@ TEST_F(TestVault, ListSecretsOnlyShowsDescribedSecrets) {
 }
 
 // Test that two different namespaces do not interfere with each other
-TEST(TestSafeKeeping, NamespaceIsolation) {
+TEST(TestVaultNsi, NamespaceIsolation) {
     const std::string key = "shared_key";
     const std::string secret1 = "Vault1_Secret";
     const std::string secret2 = "Vault2_Secret";

@@ -4,6 +4,7 @@
 #include <ranges>
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 
 // Include if the file exists
 #if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
@@ -19,7 +20,7 @@
 #include <Aclapi.h> // For EXPLICIT_ACCESSA and related functions
 #include "WinImplStorage.h"
 #elif __APPLE__
-#include "MacSecretStorage.h"
+#include "MacImplStorage.h"
 #else
 #include "LibSecretImplStorage.h"
 #endif
@@ -147,7 +148,7 @@ void validateDescription(string_view descr) {
 } // anon ns
 
 SafeKeeping::SafeKeeping(std::string name)
-    : name_{std::move(name)}
+    : name_{}, ns_name_{"com.jgaa.safekeeping."s + name}
     , info_path_{getSafeKeepingPath(name_) / "info.dat"}
 {
 
@@ -173,7 +174,7 @@ std::unique_ptr<SafeKeeping> SafeKeeping::create(std::string name, Vault vault) 
 #ifdef _WIN32
         return std::make_unique<WinSafeKeeping>(name);
 #elif __APPLE__
-        return std::make_unique<MacSecretStorage>(appName);
+        return std::make_unique<MacSafeKeeping>(std::move(name));
 #else // Linux
         return std::make_unique<LibSecretImpl>(std::move(name));
 #endif

@@ -7,72 +7,99 @@
 namespace jgaa::safekeeping {
 
 class MacSafeKeeping : public SafeKeeping {
-private:
-    std::string serviceName;
-
 public:
-    explicit MacSafeKeeping(const std::string& name) : serviceName(name) {}
+    explicit MacSafeKeeping(const std::string& name)
+        : SafeKeeping(name) {}
 
     bool storeSecret(const std::string& key, const std::string& secret) override {
-        SecKeychainItemRef item = nullptr;
+        CFStringRef service = CFStringCreateWithCString(nullptr, nsName().c_str(), kCFStringEncodingUTF8);
+        CFStringRef account = CFStringCreateWithCString(nullptr, key.c_str(), kCFStringEncodingUTF8);
+        CFDataRef secretData = CFDataCreate(nullptr, reinterpret_cast<const UInt8*>(secret.c_str()), secret.size());
 
-        // First, try to update an existing item
-        OSStatus status = SecKeychainFindGenericPassword(
-            nullptr,  // Default keychain
-            serviceName.size(), serviceName.c_str(),
-            key.size(), key.c_str(),
-            nullptr, nullptr, &item
-        );
-
-        if (status == errSecSuccess) {
-            return SecKeychainItemModifyAttributesAndData(
-                item, nullptr, secret.size(), secret.c_str()) == errSecSuccess;
+        if (!service || !account || !secretData) {
+            printf("Error: CFStringRef or CFDataRef creation failed!\n");
+            if (service) CFRelease(service);
+            if (account) CFRelease(account);
+            if (secretData) CFRelease(secretData);
+            return false;
         }
 
-        // If not found, create a new one
-        return SecKeychainAddGenericPassword(
-            nullptr, serviceName.size(), serviceName.c_str(),
-            key.size(), key.c_str(),
-            secret.size(), secret.c_str(),
-            nullptr
-        ) == errSecSuccess;
+        // Query to check if the key exists
+        CFMutableDictionaryRef query = CFDictionaryCreateMutable(nullptr, 0,
+                                                                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
+        CFDictionarySetValue(query, kSecAttrService, service);
+        CFDictionarySetValue(query, kSecAttrAccount, account);
+
+        OSStatus status = SecItemCopyMatching(query, nullptr);
+
+        if (status == errSecSuccess) {
+            // Update existing entry: Use a new dictionary
+            CFMutableDictionaryRef updateQuery = CFDictionaryCreateMutable(nullptr, 0,
+                                                                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFDictionarySetValue(updateQuery, kSecValueData, secretData);
+
+            status = SecItemUpdate(query, updateQuery);
+            CFRelease(updateQuery);
+        } else {
+            // Add new entry
+            CFDictionarySetValue(query, kSecValueData, secretData);
+            status = SecItemAdd(query, nullptr);
+        }
+
+        CFRelease(query);
+        CFRelease(service);
+        CFRelease(account);
+        CFRelease(secretData);
+
+        // if (status != errSecSuccess) {
+        //     printf("SecItemAdd failed with error: %d\n", status);
+        // }
+
+        return status == errSecSuccess;
     }
 
+
+
     std::optional<std::string> retrieveSecret(const std::string& key) override {
-        void* data = nullptr;
-        UInt32 length = 0;
+        CFStringRef service = CFStringCreateWithCString(nullptr, nsName().c_str(), kCFStringEncodingUTF8);
+        CFStringRef account = CFStringCreateWithCString(nullptr, key.c_str(), kCFStringEncodingUTF8);
 
-        OSStatus status = SecKeychainFindGenericPassword(
-            nullptr,
-            serviceName.size(), serviceName.c_str(),
-            key.size(), key.c_str(),
-            &length, &data,
-            nullptr
-        );
+        CFDictionaryRef query = CFDictionaryCreate(nullptr,
+                                                   (const void*[]) { kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnData, kSecMatchLimit },
+                                                   (const void*[]) { kSecClassGenericPassword, service, account, kCFBooleanTrue, kSecMatchLimitOne },
+                                                   5, nullptr, nullptr);
 
-        if (status != errSecSuccess) return std::nullopt;
+        CFDataRef secretData = nullptr;
+        OSStatus status = SecItemCopyMatching(query, (CFTypeRef*)&secretData);
+        CFRelease(query);
+        CFRelease(service);
+        CFRelease(account);
 
-        std::string secret((char*)data, length);
-        SecKeychainItemFreeContent(nullptr, data);
+        if (status != errSecSuccess || secretData == nullptr) {
+            return std::nullopt;
+        }
+
+        std::string secret(reinterpret_cast<const char*>(CFDataGetBytePtr(secretData)), CFDataGetLength(secretData));
+        CFRelease(secretData);
         return secret;
     }
 
     bool removeSecret(const std::string& key) override {
-        SecKeychainItemRef item = nullptr;
-        OSStatus status = SecKeychainFindGenericPassword(
-            nullptr, serviceName.size(), serviceName.c_str(),
-            key.size(), key.c_str(),
-            nullptr, nullptr, &item
-        );
+        CFStringRef service = CFStringCreateWithCString(nullptr, nsName().c_str(), kCFStringEncodingUTF8);
+        CFStringRef account = CFStringCreateWithCString(nullptr, key.c_str(), kCFStringEncodingUTF8);
 
-        if (status == errSecSuccess && item) {
-            return SecKeychainItemDelete(item) == errSecSuccess;
-        }
-        return false;
-    }
+        removeDescription(key);
+        CFDictionaryRef query = CFDictionaryCreate(nullptr,
+                                                   (const void*[]) { kSecClass, kSecAttrService, kSecAttrAccount },
+                                                   (const void*[]) { kSecClassGenericPassword, service, account },
+                                                   3, nullptr, nullptr);
 
-    std::vector<std::string> listSecrets() override {
-        return {"Listing stored secrets is not supported by macOS Keychain"};
+        OSStatus status = SecItemDelete(query);
+        CFRelease(query);
+        CFRelease(service);
+        CFRelease(account);
+        return status == errSecSuccess;
     }
 };
 
