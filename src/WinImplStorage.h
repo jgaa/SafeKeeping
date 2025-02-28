@@ -10,8 +10,6 @@
 namespace jgaa::safekeeping {
 
 class WinSafeKeeping : public SafeKeeping {
-private:
-    std::string appName;
 
 public:
     explicit WinSafeKeeping(const std::string& name) : SafeKeeping(name) {}
@@ -47,7 +45,7 @@ public:
 
 private:
     std::string getTargetName(const std::string& key) {
-		return std::format("{}_{}", name(), key);
+		return std::format("{}_{}", nsName(), key);
 	}
 
 };
