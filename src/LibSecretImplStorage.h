@@ -13,7 +13,7 @@ public:
         : SafeKeeping(std::move(name)) {}
 
     bool storeSecret(const std::string& key, const std::string& secret) override {
-        std::string namespacedKey = name() + "/" + key;
+        std::string namespacedKey = nsName() + "/" + key;
 
         SecretSchema schema = {
             "SafeKeepingSchema",
@@ -38,7 +38,7 @@ public:
 
 
     std::optional<std::string> retrieveSecret(const std::string& key) override {
-        std::string namespacedKey = name() + "/" + key;
+        std::string namespacedKey = nsName() + "/" + key;
 
         SecretSchema schema = {
             "SafeKeepingSchema",
@@ -65,7 +65,7 @@ public:
     }
 
     bool removeSecret(const std::string& key) override {
-        std::string namespacedKey = name() + "/" + key;
+        std::string namespacedKey = nsName() + "/" + key;
 
         SecretSchema schema = {
             "SafeKeepingSchema",
