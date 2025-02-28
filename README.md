@@ -18,13 +18,12 @@ working with both **KDE (KWallet)** and **GNOME Keyring**.
 🚧 **Initial implementation in progress.** 🚧
 
 ## **Supported Platforms**
-✅ = Implemented | ❌ = Not yet implemented
 
 | Platform        | Status       |
 |----------------|-------------|
 | **Linux (KDE)**   | ✅ Works with KWallet (KDE Desktop)|
 | **Linux (GNOME)** | ✅ Works with GNOME Keyring (Gnome Desktop) |
-| **macOS**         | ❌ Not yet tested (Keychain Services) |
+| **macOS**         | ✅ Works (Keychain Services) |
 | **Windows 10**    | ✅ Works (Credential Manager) |
 | **Windows 11**    | ✅ Works (Credential Manager) |
 
