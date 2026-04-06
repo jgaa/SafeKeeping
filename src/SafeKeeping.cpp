@@ -169,6 +169,9 @@ public:
     virtual std::optional<std::string> load(std::string_view namespaceName,
                                             std::string_view key) = 0;
     virtual bool remove(std::string_view namespaceName, std::string_view key) = 0;
+    [[nodiscard]] virtual std::string lastErrorMessage() const {
+        return {};
+    }
 };
 
 [[nodiscard]] int64_t nowSeconds() {
@@ -261,6 +264,15 @@ void validateLinuxVaultRootName(std::string_view name) {
 [[nodiscard]] std::string linuxVaultRootName() {
     std::scoped_lock lock(linuxVaultRootMutex());
     return linuxVaultRootStorage();
+}
+
+[[nodiscard]] std::string kwalletAppId() {
+    const std::string root = linuxVaultRootName();
+    const auto pos = root.find_last_of('.');
+    if (pos == std::string::npos || pos + 1 >= root.size()) {
+        return root;
+    }
+    return root.substr(pos + 1);
 }
 
 void validateSecretValue(byte_view secret) {
@@ -734,6 +746,10 @@ using dbus_message_ptr = std::unique_ptr<DBusMessage, DBusMessageDeleter>;
 
 class KWalletVaultBackend final : public VaultBackend {
 public:
+    [[nodiscard]] std::string lastErrorMessage() const override {
+        return lastError_;
+    }
+
     bool available() const override {
         if (envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT") ||
             envFlagEnabled("SAFEKEEPING_FORCE_LIBSECRET")) {
@@ -746,6 +762,7 @@ public:
     }
 
     bool store(std::string_view namespaceName, std::string_view key, std::string_view value) override {
+        clearLastError();
         if (!available()) {
             return false;
         }
@@ -760,7 +777,7 @@ public:
         const char* folder = folderValue.c_str();
         const char* entryKey = entry.c_str();
         const char* secret = value.data();
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
 
         return callIntMethod(wallet->service,
@@ -779,6 +796,7 @@ public:
     }
 
     std::optional<std::string> load(std::string_view namespaceName, std::string_view key) override {
+        clearLastError();
         if (!available()) {
             return std::nullopt;
         }
@@ -796,7 +814,7 @@ public:
         const std::string folderValue = linuxVaultRootName();
         const char* folder = folderValue.c_str();
         const char* entryKey = entry.c_str();
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
         return callStringMethod(wallet->service,
                                 wallet->path,
@@ -813,6 +831,7 @@ public:
     }
 
     bool remove(std::string_view namespaceName, std::string_view key) override {
+        clearLastError();
         if (!available()) {
             return false;
         }
@@ -830,7 +849,7 @@ public:
         const std::string folderValue = linuxVaultRootName();
         const char* folder = folderValue.c_str();
         const char* entryKey = entry.c_str();
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
         return callIntMethod(wallet->service,
                              wallet->path,
@@ -866,7 +885,7 @@ private:
                     return;
                 }
                 const dbus_bool_t force = FALSE;
-                const std::string appIdValue = linuxVaultRootName();
+                const std::string appIdValue = kwalletAppId();
                 const char* appId = appIdValue.c_str();
                 dbus_message_append_args(message.get(),
                                          DBUS_TYPE_INT32, &handle,
@@ -883,13 +902,22 @@ private:
 
     static constexpr int kDbusTimeoutMs = 5000;
 
+    void clearLastError() const {
+        lastError_.clear();
+    }
+
+    void setLastError(std::string message) const {
+        lastError_ = std::move(message);
+    }
+
     template <typename AppendArgs>
-    static dbus_message_ptr callMethod(std::string_view service,
-                                       std::string_view path,
-                                       std::string_view method,
-                                       AppendArgs appendArgs) {
+    dbus_message_ptr callMethod(std::string_view service,
+                                std::string_view path,
+                                std::string_view method,
+                                AppendArgs appendArgs) const {
         DBusConnection* bus = sessionBusConnection();
         if (bus == nullptr) {
+            setLastError("KWallet session bus is not available");
             return {};
         }
 
@@ -898,6 +926,7 @@ private:
                                                               "org.kde.KWallet",
                                                               toString(method).c_str()));
         if (!message) {
+            setLastError("failed to create KWallet D-Bus message for " + toString(method));
             return {};
         }
 
@@ -906,16 +935,21 @@ private:
         dbus_message_ptr reply(
             dbus_connection_send_with_reply_and_block(bus, message.get(), kDbusTimeoutMs, &error.error));
         if (error.hasError()) {
+            setLastError("KWallet " + toString(method) + " failed: " +
+                         (error.error.message != nullptr ? std::string(error.error.message) : "unknown D-Bus error"));
             return {};
+        }
+        if (!reply) {
+            setLastError("KWallet " + toString(method) + " returned no reply");
         }
         return reply;
     }
 
     template <typename AppendArgs>
-    static std::optional<std::string> callStringMethod(std::string_view service,
-                                                       std::string_view path,
-                                                       std::string_view method,
-                                                       AppendArgs appendArgs) {
+    std::optional<std::string> callStringMethod(std::string_view service,
+                                                std::string_view path,
+                                                std::string_view method,
+                                                AppendArgs appendArgs) const {
         auto reply = callMethod(service, path, method, appendArgs);
         if (!reply) {
             return std::nullopt;
@@ -925,16 +959,17 @@ private:
         const char* value = nullptr;
         if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_STRING, &value, DBUS_TYPE_INVALID) == FALSE ||
             error.hasError() || value == nullptr) {
+            setLastError("KWallet " + toString(method) + " returned an unexpected reply");
             return std::nullopt;
         }
         return std::string(value);
     }
 
     template <typename AppendArgs>
-    static std::optional<dbus_int32_t> callIntMethod(std::string_view service,
-                                                     std::string_view path,
-                                                     std::string_view method,
-                                                     AppendArgs appendArgs) {
+    std::optional<dbus_int32_t> callIntMethod(std::string_view service,
+                                              std::string_view path,
+                                              std::string_view method,
+                                              AppendArgs appendArgs) const {
         auto reply = callMethod(service, path, method, appendArgs);
         if (!reply) {
             return std::nullopt;
@@ -944,16 +979,17 @@ private:
         dbus_int32_t value = -1;
         if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_INT32, &value, DBUS_TYPE_INVALID) == FALSE ||
             error.hasError()) {
+            setLastError("KWallet " + toString(method) + " returned an unexpected reply");
             return std::nullopt;
         }
         return value;
     }
 
     template <typename AppendArgs>
-    static std::optional<bool> callBoolMethod(std::string_view service,
-                                              std::string_view path,
-                                              std::string_view method,
-                                              AppendArgs appendArgs) {
+    std::optional<bool> callBoolMethod(std::string_view service,
+                                       std::string_view path,
+                                       std::string_view method,
+                                       AppendArgs appendArgs) const {
         auto reply = callMethod(service, path, method, appendArgs);
         if (!reply) {
             return std::nullopt;
@@ -963,14 +999,16 @@ private:
         dbus_bool_t value = FALSE;
         if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_BOOLEAN, &value, DBUS_TYPE_INVALID) == FALSE ||
             error.hasError()) {
+            setLastError("KWallet " + toString(method) + " returned an unexpected reply");
             return std::nullopt;
         }
         return value != FALSE;
     }
 
-    static std::optional<WalletHandle> openWallet() {
+    std::optional<WalletHandle> openWallet() const {
         const auto address = kwalletServiceAddress();
         if (!address.has_value()) {
+            setLastError("KWallet daemon is not available on the session bus");
             return std::nullopt;
         }
 
@@ -981,7 +1019,7 @@ private:
 
         const char* wallet = walletName->c_str();
         const dbus_int64_t windowId = 0;
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
         auto handle = callIntMethod(address->first,
                                     address->second,
@@ -994,6 +1032,10 @@ private:
                                                                  DBUS_TYPE_INVALID);
                                     });
         if (!handle.has_value() || *handle < 0) {
+            if (!lastError_.empty()) {
+                return std::nullopt;
+            }
+            setLastError("KWallet open returned an invalid handle");
             return std::nullopt;
         }
 
@@ -1004,10 +1046,10 @@ private:
         };
     }
 
-    static bool ensureFolder(const WalletHandle& wallet) {
+    bool ensureFolder(const WalletHandle& wallet) const {
         const std::string folderValue = linuxVaultRootName();
         const char* folder = folderValue.c_str();
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
 
         const auto exists = callBoolMethod(wallet.service,
@@ -1042,11 +1084,11 @@ private:
         return created == std::optional<bool>{true};
     }
 
-    static bool hasEntry(const WalletHandle& wallet, const std::string& entry) {
+    bool hasEntry(const WalletHandle& wallet, const std::string& entry) const {
         const std::string folderValue = linuxVaultRootName();
         const char* folder = folderValue.c_str();
         const char* entryKey = entry.c_str();
-        const std::string appIdValue = linuxVaultRootName();
+        const std::string appIdValue = kwalletAppId();
         const char* appId = appIdValue.c_str();
         const auto exists = callBoolMethod(wallet.service,
                                            wallet.path,
@@ -1066,6 +1108,8 @@ private:
     static std::string entryName(std::string_view namespaceName, std::string_view key) {
         return toString(namespaceName) + "/" + toString(key);
     }
+
+    mutable std::string lastError_;
 };
 
 class LibSecretVaultBackend final : public VaultBackend {
@@ -1574,7 +1618,10 @@ public:
             if (options.createSystemVaultSlot && vaultAvailable) {
                 const std::string vaultMaterial = bytesToHex(randomBytes(32));
                 if (!vaultBackend->store(namespaceName, kVaultEntryName, vaultMaterial)) {
-                    throw std::runtime_error("failed to store vault material");
+                    const std::string detail = vaultBackend->lastErrorMessage();
+                    throw std::runtime_error(
+                        detail.empty() ? "failed to store vault material"
+                                       : "failed to store vault material: " + detail);
                 }
                 const auto kek = deriveVaultKek(vaultMaterial);
                 insertSlot(db.get(),
@@ -1969,7 +2016,10 @@ public:
 
         const std::string material = bytesToHex(randomBytes(32));
         if (!vaultBackend_->store(namespaceName_, kVaultEntryName, material)) {
-            fail(Error::VaultError, "failed to store namespace material in the system vault");
+            const std::string detail = vaultBackend_->lastErrorMessage();
+            fail(Error::VaultError,
+                 detail.empty() ? "failed to store namespace material in the system vault"
+                                : "failed to store namespace material in the system vault: " + detail);
         }
 
         Transaction txn(db_.get());
