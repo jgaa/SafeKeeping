@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <span>
@@ -29,6 +30,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
 #elif defined(__linux__) || defined(__unix__)
+#include <dbus/dbus.h>
 #include <libsecret/secret.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -85,6 +87,7 @@ constexpr std::string_view kSlotTypeVault = "vault";
 constexpr std::string_view kSlotTypePassphrase = "passphrase";
 constexpr std::string_view kSlotTypeRecovery = "recovery";
 constexpr std::size_t kMaxSecretSize = 10 * 1024;
+constexpr std::string_view kDefaultLinuxVaultRootName = "com.jgaa.SafeKeeping";
 
 class OperationError : public std::runtime_error {
 public:
@@ -235,6 +238,29 @@ void validateDescription(std::string_view description) {
     if (description.size() > 4096) {
         fail(SafeKeeping::Error::InvalidArgument, "description is too long");
     }
+}
+
+void validateLinuxVaultRootName(std::string_view name) {
+    static const std::regex validName{R"(^[A-Za-z0-9_.-]{1,128}$)"};
+
+    if (!std::regex_match(name.begin(), name.end(), validName)) {
+        throw std::invalid_argument("linux vault root name must match [A-Za-z0-9_.-]{1,128}");
+    }
+}
+
+[[nodiscard]] std::string& linuxVaultRootStorage() {
+    static std::string value(kDefaultLinuxVaultRootName);
+    return value;
+}
+
+[[nodiscard]] std::mutex& linuxVaultRootMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+[[nodiscard]] std::string linuxVaultRootName() {
+    std::scoped_lock lock(linuxVaultRootMutex());
+    return linuxVaultRootStorage();
 }
 
 void validateSecretValue(byte_view secret) {
@@ -633,6 +659,415 @@ private:
 };
 
 #if defined(__linux__) || defined(__unix__)
+struct DBusErrorScope {
+    DBusErrorScope() {
+        dbus_error_init(&error);
+    }
+
+    ~DBusErrorScope() {
+        dbus_error_free(&error);
+    }
+
+    [[nodiscard]] bool hasError() const noexcept {
+        return dbus_error_is_set(&error) != FALSE;
+    }
+
+    DBusError error;
+};
+
+struct DBusMessageDeleter {
+    void operator()(DBusMessage* message) const noexcept {
+        if (message != nullptr) {
+            dbus_message_unref(message);
+        }
+    }
+};
+
+using dbus_message_ptr = std::unique_ptr<DBusMessage, DBusMessageDeleter>;
+
+[[nodiscard]] DBusConnection* sessionBusConnection() {
+    static DBusConnection* connection = []() -> DBusConnection* {
+        DBusErrorScope error;
+        DBusConnection* bus = dbus_bus_get(DBUS_BUS_SESSION, &error.error);
+        if (error.hasError() || bus == nullptr) {
+            return nullptr;
+        }
+        dbus_connection_set_exit_on_disconnect(bus, FALSE);
+        return bus;
+    }();
+    return connection;
+}
+
+[[nodiscard]] bool dbusNameHasOwner(std::string_view name) {
+    if (DBusConnection* bus = sessionBusConnection(); bus != nullptr) {
+        DBusErrorScope error;
+        const dbus_bool_t hasOwner = dbus_bus_name_has_owner(bus, toString(name).c_str(), &error.error);
+        return !error.hasError() && hasOwner != FALSE;
+    }
+    return false;
+}
+
+[[nodiscard]] bool isKdeSession() {
+    const auto containsToken = [](const char* name, std::string_view token) {
+        if (const char* value = std::getenv(name); value != nullptr) {
+            const std::string normalized = toString(value);
+            return normalized.find(toString(token)) != std::string::npos;
+        }
+        return false;
+    };
+
+    return envFlagEnabled("KDE_FULL_SESSION") ||
+        containsToken("XDG_CURRENT_DESKTOP", "KDE") ||
+        containsToken("DESKTOP_SESSION", "plasma") ||
+        containsToken("DESKTOP_SESSION", "kde");
+}
+
+[[nodiscard]] std::optional<std::pair<std::string, std::string>> kwalletServiceAddress() {
+    if (dbusNameHasOwner("org.kde.kwalletd6")) {
+        return std::pair{std::string("org.kde.kwalletd6"), std::string("/modules/kwalletd6")};
+    }
+    if (dbusNameHasOwner("org.kde.kwalletd5")) {
+        return std::pair{std::string("org.kde.kwalletd5"), std::string("/modules/kwalletd5")};
+    }
+    return std::nullopt;
+}
+
+class KWalletVaultBackend final : public VaultBackend {
+public:
+    bool available() const override {
+        if (envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT") ||
+            envFlagEnabled("SAFEKEEPING_FORCE_LIBSECRET")) {
+            return false;
+        }
+        if (!envFlagEnabled("SAFEKEEPING_FORCE_KWALLET") && !isKdeSession()) {
+            return false;
+        }
+        return kwalletServiceAddress().has_value();
+    }
+
+    bool store(std::string_view namespaceName, std::string_view key, std::string_view value) override {
+        if (!available()) {
+            return false;
+        }
+
+        auto wallet = openWallet();
+        if (!wallet.has_value() || !ensureFolder(*wallet)) {
+            return false;
+        }
+
+        const std::string entry = entryName(namespaceName, key);
+        const std::string folderValue = linuxVaultRootName();
+        const char* folder = folderValue.c_str();
+        const char* entryKey = entry.c_str();
+        const char* secret = value.data();
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+
+        return callIntMethod(wallet->service,
+                             wallet->path,
+                             "writePassword",
+                             [&](DBusMessage* message) {
+                                 const dbus_int32_t handle = wallet->handle;
+                                 dbus_message_append_args(message,
+                                                          DBUS_TYPE_INT32, &handle,
+                                                          DBUS_TYPE_STRING, &folder,
+                                                          DBUS_TYPE_STRING, &entryKey,
+                                                          DBUS_TYPE_STRING, &secret,
+                                                          DBUS_TYPE_STRING, &appId,
+                                                          DBUS_TYPE_INVALID);
+                             }) == 0;
+    }
+
+    std::optional<std::string> load(std::string_view namespaceName, std::string_view key) override {
+        if (!available()) {
+            return std::nullopt;
+        }
+
+        auto wallet = openWallet();
+        if (!wallet.has_value() || !ensureFolder(*wallet)) {
+            return std::nullopt;
+        }
+
+        const std::string entry = entryName(namespaceName, key);
+        if (!hasEntry(*wallet, entry)) {
+            return std::nullopt;
+        }
+
+        const std::string folderValue = linuxVaultRootName();
+        const char* folder = folderValue.c_str();
+        const char* entryKey = entry.c_str();
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+        return callStringMethod(wallet->service,
+                                wallet->path,
+                                "readPassword",
+                                [&](DBusMessage* message) {
+                                    const dbus_int32_t handle = wallet->handle;
+                                    dbus_message_append_args(message,
+                                                             DBUS_TYPE_INT32, &handle,
+                                                             DBUS_TYPE_STRING, &folder,
+                                                             DBUS_TYPE_STRING, &entryKey,
+                                                             DBUS_TYPE_STRING, &appId,
+                                                             DBUS_TYPE_INVALID);
+                                });
+    }
+
+    bool remove(std::string_view namespaceName, std::string_view key) override {
+        if (!available()) {
+            return false;
+        }
+
+        auto wallet = openWallet();
+        if (!wallet.has_value() || !ensureFolder(*wallet)) {
+            return false;
+        }
+
+        const std::string entry = entryName(namespaceName, key);
+        if (!hasEntry(*wallet, entry)) {
+            return false;
+        }
+
+        const std::string folderValue = linuxVaultRootName();
+        const char* folder = folderValue.c_str();
+        const char* entryKey = entry.c_str();
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+        return callIntMethod(wallet->service,
+                             wallet->path,
+                             "removeEntry",
+                             [&](DBusMessage* message) {
+                                 const dbus_int32_t handle = wallet->handle;
+                                 dbus_message_append_args(message,
+                                                          DBUS_TYPE_INT32, &handle,
+                                                          DBUS_TYPE_STRING, &folder,
+                                                          DBUS_TYPE_STRING, &entryKey,
+                                                          DBUS_TYPE_STRING, &appId,
+                                                          DBUS_TYPE_INVALID);
+                             }) == 0;
+    }
+
+private:
+    struct WalletHandle {
+        std::string service;
+        std::string path;
+        dbus_int32_t handle = -1;
+
+        ~WalletHandle() {
+            if (handle < 0) {
+                return;
+            }
+
+            if (DBusConnection* bus = sessionBusConnection(); bus != nullptr) {
+                dbus_message_ptr message(dbus_message_new_method_call(service.c_str(),
+                                                                      path.c_str(),
+                                                                      "org.kde.KWallet",
+                                                                      "close"));
+                if (!message) {
+                    return;
+                }
+                const dbus_bool_t force = FALSE;
+                const std::string appIdValue = linuxVaultRootName();
+                const char* appId = appIdValue.c_str();
+                dbus_message_append_args(message.get(),
+                                         DBUS_TYPE_INT32, &handle,
+                                         DBUS_TYPE_BOOLEAN, &force,
+                                         DBUS_TYPE_STRING, &appId,
+                                         DBUS_TYPE_INVALID);
+                DBusErrorScope error;
+                dbus_message_ptr reply(
+                    dbus_connection_send_with_reply_and_block(bus, message.get(), kDbusTimeoutMs, &error.error));
+                (void)reply;
+            }
+        }
+    };
+
+    static constexpr int kDbusTimeoutMs = 5000;
+
+    template <typename AppendArgs>
+    static dbus_message_ptr callMethod(std::string_view service,
+                                       std::string_view path,
+                                       std::string_view method,
+                                       AppendArgs appendArgs) {
+        DBusConnection* bus = sessionBusConnection();
+        if (bus == nullptr) {
+            return {};
+        }
+
+        dbus_message_ptr message(dbus_message_new_method_call(toString(service).c_str(),
+                                                              toString(path).c_str(),
+                                                              "org.kde.KWallet",
+                                                              toString(method).c_str()));
+        if (!message) {
+            return {};
+        }
+
+        appendArgs(message.get());
+        DBusErrorScope error;
+        dbus_message_ptr reply(
+            dbus_connection_send_with_reply_and_block(bus, message.get(), kDbusTimeoutMs, &error.error));
+        if (error.hasError()) {
+            return {};
+        }
+        return reply;
+    }
+
+    template <typename AppendArgs>
+    static std::optional<std::string> callStringMethod(std::string_view service,
+                                                       std::string_view path,
+                                                       std::string_view method,
+                                                       AppendArgs appendArgs) {
+        auto reply = callMethod(service, path, method, appendArgs);
+        if (!reply) {
+            return std::nullopt;
+        }
+
+        DBusErrorScope error;
+        const char* value = nullptr;
+        if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_STRING, &value, DBUS_TYPE_INVALID) == FALSE ||
+            error.hasError() || value == nullptr) {
+            return std::nullopt;
+        }
+        return std::string(value);
+    }
+
+    template <typename AppendArgs>
+    static std::optional<dbus_int32_t> callIntMethod(std::string_view service,
+                                                     std::string_view path,
+                                                     std::string_view method,
+                                                     AppendArgs appendArgs) {
+        auto reply = callMethod(service, path, method, appendArgs);
+        if (!reply) {
+            return std::nullopt;
+        }
+
+        DBusErrorScope error;
+        dbus_int32_t value = -1;
+        if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_INT32, &value, DBUS_TYPE_INVALID) == FALSE ||
+            error.hasError()) {
+            return std::nullopt;
+        }
+        return value;
+    }
+
+    template <typename AppendArgs>
+    static std::optional<bool> callBoolMethod(std::string_view service,
+                                              std::string_view path,
+                                              std::string_view method,
+                                              AppendArgs appendArgs) {
+        auto reply = callMethod(service, path, method, appendArgs);
+        if (!reply) {
+            return std::nullopt;
+        }
+
+        DBusErrorScope error;
+        dbus_bool_t value = FALSE;
+        if (dbus_message_get_args(reply.get(), &error.error, DBUS_TYPE_BOOLEAN, &value, DBUS_TYPE_INVALID) == FALSE ||
+            error.hasError()) {
+            return std::nullopt;
+        }
+        return value != FALSE;
+    }
+
+    static std::optional<WalletHandle> openWallet() {
+        const auto address = kwalletServiceAddress();
+        if (!address.has_value()) {
+            return std::nullopt;
+        }
+
+        auto walletName = callStringMethod(address->first, address->second, "localWallet", [](DBusMessage*) {});
+        if (!walletName.has_value()) {
+            return std::nullopt;
+        }
+
+        const char* wallet = walletName->c_str();
+        const dbus_int64_t windowId = 0;
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+        auto handle = callIntMethod(address->first,
+                                    address->second,
+                                    "open",
+                                    [&](DBusMessage* message) {
+                                        dbus_message_append_args(message,
+                                                                 DBUS_TYPE_STRING, &wallet,
+                                                                 DBUS_TYPE_INT64, &windowId,
+                                                                 DBUS_TYPE_STRING, &appId,
+                                                                 DBUS_TYPE_INVALID);
+                                    });
+        if (!handle.has_value() || *handle < 0) {
+            return std::nullopt;
+        }
+
+        return WalletHandle{
+            .service = address->first,
+            .path = address->second,
+            .handle = *handle,
+        };
+    }
+
+    static bool ensureFolder(const WalletHandle& wallet) {
+        const std::string folderValue = linuxVaultRootName();
+        const char* folder = folderValue.c_str();
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+
+        const auto exists = callBoolMethod(wallet.service,
+                                           wallet.path,
+                                           "hasFolder",
+                                           [&](DBusMessage* message) {
+                                               const dbus_int32_t handle = wallet.handle;
+                                               dbus_message_append_args(message,
+                                                                        DBUS_TYPE_INT32, &handle,
+                                                                        DBUS_TYPE_STRING, &folder,
+                                                                        DBUS_TYPE_STRING, &appId,
+                                                                        DBUS_TYPE_INVALID);
+                                           });
+        if (exists == std::optional<bool>{true}) {
+            return true;
+        }
+        if (!exists.has_value()) {
+            return false;
+        }
+
+        const auto created = callBoolMethod(wallet.service,
+                                            wallet.path,
+                                            "createFolder",
+                                            [&](DBusMessage* message) {
+                                                const dbus_int32_t handle = wallet.handle;
+                                                dbus_message_append_args(message,
+                                                                         DBUS_TYPE_INT32, &handle,
+                                                                         DBUS_TYPE_STRING, &folder,
+                                                                         DBUS_TYPE_STRING, &appId,
+                                                                         DBUS_TYPE_INVALID);
+                                            });
+        return created == std::optional<bool>{true};
+    }
+
+    static bool hasEntry(const WalletHandle& wallet, const std::string& entry) {
+        const std::string folderValue = linuxVaultRootName();
+        const char* folder = folderValue.c_str();
+        const char* entryKey = entry.c_str();
+        const std::string appIdValue = linuxVaultRootName();
+        const char* appId = appIdValue.c_str();
+        const auto exists = callBoolMethod(wallet.service,
+                                           wallet.path,
+                                           "hasEntry",
+                                           [&](DBusMessage* message) {
+                                               const dbus_int32_t handle = wallet.handle;
+                                               dbus_message_append_args(message,
+                                                                        DBUS_TYPE_INT32, &handle,
+                                                                        DBUS_TYPE_STRING, &folder,
+                                                                        DBUS_TYPE_STRING, &entryKey,
+                                                                        DBUS_TYPE_STRING, &appId,
+                                                                        DBUS_TYPE_INVALID);
+                                           });
+        return exists == std::optional<bool>{true};
+    }
+
+    static std::string entryName(std::string_view namespaceName, std::string_view key) {
+        return toString(namespaceName) + "/" + toString(key);
+    }
+};
+
 class LibSecretVaultBackend final : public VaultBackend {
 public:
     bool available() const override {
@@ -644,14 +1079,16 @@ public:
             return false;
         }
         const std::string account = accountName(namespaceName, key);
+        const std::string service = serviceName(namespaceName);
         GError* error = nullptr;
         const gboolean ok = secret_password_store_sync(
             &schema(),
             SECRET_COLLECTION_DEFAULT,
-            account.c_str(),
+            displayLabel(namespaceName, key).c_str(),
             value.data(),
             nullptr,
             &error,
+            "service", service.c_str(),
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
@@ -665,11 +1102,13 @@ public:
             return std::nullopt;
         }
         const std::string account = accountName(namespaceName, key);
+        const std::string service = serviceName(namespaceName);
         GError* error = nullptr;
         gchar* secret = secret_password_lookup_sync(
             &schema(),
             nullptr,
             &error,
+            "service", service.c_str(),
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
@@ -688,11 +1127,13 @@ public:
             return false;
         }
         const std::string account = accountName(namespaceName, key);
+        const std::string service = serviceName(namespaceName);
         GError* error = nullptr;
         const gboolean ok = secret_password_clear_sync(
             &schema(),
             nullptr,
             &error,
+            "service", service.c_str(),
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
@@ -704,16 +1145,25 @@ public:
 private:
     static SecretSchema& schema() {
         static SecretSchema schemaValue = {
-            "com.jgaa.safekeeping",
-            SECRET_SCHEMA_NONE,
-            {{"account", SECRET_SCHEMA_ATTRIBUTE_STRING},
+            "SafeKeepingSchema",
+            SECRET_SCHEMA_DONT_MATCH_NAME,
+            {{"service", SECRET_SCHEMA_ATTRIBUTE_STRING},
+             {"account", SECRET_SCHEMA_ATTRIBUTE_STRING},
              {nullptr, SECRET_SCHEMA_ATTRIBUTE_STRING}},
         };
         return schemaValue;
     }
 
+    static std::string serviceName(std::string_view namespaceName) {
+        return linuxVaultRootName() + "/" + toString(namespaceName);
+    }
+
     static std::string accountName(std::string_view namespaceName, std::string_view key) {
-        return "safekeeping/" + toString(namespaceName) + "/" + toString(key);
+        return toString(namespaceName) + "/" + toString(key);
+    }
+
+    static std::string displayLabel(std::string_view namespaceName, std::string_view key) {
+        return linuxVaultRootName() + "/" + accountName(namespaceName, key);
     }
 };
 #elif defined(__APPLE__)
@@ -878,6 +1328,9 @@ std::unique_ptr<VaultBackend> makeVaultBackend() {
         return std::make_unique<FileVaultBackend>(fakeVault);
     }
 #if defined(__linux__) || defined(__unix__)
+    if (auto kwallet = std::make_unique<KWalletVaultBackend>(); kwallet->available()) {
+        return kwallet;
+    }
     return std::make_unique<LibSecretVaultBackend>();
 #elif defined(__APPLE__)
     return std::make_unique<MacVaultBackend>();
@@ -1771,6 +2224,16 @@ std::unique_ptr<SafeKeeping> SafeKeeping::openOrCreate(std::string namespaceName
         return open(std::move(namespaceName));
     }
     return createNew(std::move(namespaceName), std::move(options)).instance;
+}
+
+void SafeKeeping::setLinuxVaultRootName(std::string name) {
+    validateLinuxVaultRootName(name);
+    std::scoped_lock lock(linuxVaultRootMutex());
+    linuxVaultRootStorage() = std::move(name);
+}
+
+std::string SafeKeeping::linuxVaultRootName() {
+    return jgaa::safekeeping::linuxVaultRootName();
 }
 
 bool SafeKeeping::exists(std::string_view namespaceName) {

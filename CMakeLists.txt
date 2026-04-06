@@ -53,7 +53,8 @@ elseif(APPLE)
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SECRET REQUIRED IMPORTED_TARGET libsecret-1)
-    target_link_libraries(safekeeping PRIVATE PkgConfig::SECRET)
+    pkg_check_modules(DBUS REQUIRED IMPORTED_TARGET dbus-1)
+    target_link_libraries(safekeeping PRIVATE PkgConfig::SECRET PkgConfig::DBUS)
 endif()
 
 install(FILES

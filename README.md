@@ -14,7 +14,7 @@ All these servers require authentication, using different methods:
 Since this tool is meant for **production environments**, I don't want credentials to be stored **in plain text on disk**.
 I needed a simple, cross-platform way to handle secrets securely.
 
-On **Linux**, I found that `libsecret` provides a **standardized way** to store credentials securely, working with both **KDE (KWallet)** and **GNOME Keyring**.
+On **Linux**, the library uses a native **KWallet** backend when running in a KDE session, and falls back to `libsecret` on other desktops.
 
 ## **Status**
 
@@ -24,7 +24,7 @@ Beta
 
 | Platform          | Status                                     |
 | ----------------- | ------------------------------------------ |
-| **Linux (KDE)**   | ✅ Works with KWallet (KDE Desktop)         |
+| **Linux (KDE)**   | ✅ Works with native KWallet                  |
 | **Linux (GNOME)** | ✅ Works with GNOME Keyring (GNOME Desktop) |
 | **macOS**         | ✅ Works (Keychain Services)                |
 | **Windows 10**    | ✅ Works (Credential Manager)               |
@@ -43,6 +43,10 @@ However, Windows Credential Manager has a 512-byte limit on secrets, so I was un
 
 In the current version of this library, the actual secrets are stored as encrypted blobs in a local SQLite database.
 Only the decryption key is stored (per namespace) in the system’s vault.
+
+On Linux, the current design stores one vault item per namespace unlock slot rather than one vault item per secret. KDE sessions store that item in a native KWallet folder named after the configured Linux vault root, while other Linux desktops store it through `libsecret`.
+
+By default, the Linux vault root name is `com.jgaa.SafeKeeping`. Applications can override it during startup with `SafeKeeping::setLinuxVaultRootName(...)` to avoid collisions or to group entries under an application-specific folder/service name.
 
 This new design also makes it possible to generate a recovery key, as well as use an additional password/passphrase, so data can be extracted from the vault (for example, from a backup) even if the system's secret vault is lost.
 These are optional features, but they may prove quite useful.

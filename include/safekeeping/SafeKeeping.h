@@ -167,6 +167,25 @@ public:
      */
     static ptr_t openOrCreate(std::string namespaceName, CreateOptions options);
     /**
+     * @brief Set the Linux system-vault root name used for KWallet/libsecret entries.
+     *
+     * On KDE, this becomes the KWallet folder name. On other Linux desktops,
+     * it becomes the libsecret service-name prefix. The default is
+     * `com.jgaa.SafeKeeping`.
+     *
+     * Set this during application startup before creating or opening
+     * namespaces if you need an application-specific root.
+     *
+     * @param name Non-empty root name.
+     * @throws std::exception on invalid names.
+     */
+    static void setLinuxVaultRootName(std::string name);
+    /**
+     * @brief Get the configured Linux system-vault root name.
+     * @return The current Linux vault root name.
+     */
+    [[nodiscard]] static std::string linuxVaultRootName();
+    /**
      * @brief Check whether a namespace database exists.
      * @param namespaceName Namespace identifier.
      * @return `true` if the namespace exists.

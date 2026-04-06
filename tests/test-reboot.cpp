@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <span>
 #include <string>
@@ -24,6 +25,20 @@ namespace {
 std::string uniqueName(std::string_view prefix) {
     return std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
         std::to_string(std::rand());
+}
+
+std::optional<std::string> envString(const char* name) {
+    if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+        return std::string(value);
+    }
+    return std::nullopt;
+}
+
+bool envFlagEnabled(const char* name) {
+    const auto value = envString(name);
+    return value == std::optional<std::string>{"1"} ||
+        value == std::optional<std::string>{"true"} ||
+        value == std::optional<std::string>{"TRUE"};
 }
 
 void setEnvVar(const char* name, const fs::path& value) {
@@ -59,12 +74,14 @@ protected:
         root_ = fs::temp_directory_path() / uniqueName("safekeeping-reboot");
         vaultRoot_ = root_ / "fake-vault";
         fs::create_directories(root_);
+        SafeKeeping::setLinuxVaultRootName("com.jgaa.SafeKeeping");
         setEnvVar("SAFEKEEPING_DATA_DIR", root_);
         setEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR", vaultRoot_);
         unsetEnvVar("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
     }
 
     void TearDown() override {
+        SafeKeeping::setLinuxVaultRootName("com.jgaa.SafeKeeping");
         unsetEnvVar("SAFEKEEPING_DATA_DIR");
         unsetEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR");
         unsetEnvVar("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
@@ -343,3 +360,83 @@ TEST_F(SafeKeepingRebootTest, OpenOrCreateCreatesThenReopensNamespace) {
     ASSERT_TRUE(reopened->unlockWithPassphrase("pw"));
     EXPECT_EQ(reopened->retrieveSecret("token"), std::optional<std::string>("value"));
 }
+
+TEST_F(SafeKeepingRebootTest, LinuxVaultRootNameCanBeConfigured) {
+#if defined(__linux__) || defined(__unix__)
+    const auto original = SafeKeeping::linuxVaultRootName();
+    EXPECT_EQ(original, "com.jgaa.SafeKeeping");
+
+    SafeKeeping::setLinuxVaultRootName("org.example.TestApp");
+    EXPECT_EQ(SafeKeeping::linuxVaultRootName(), "org.example.TestApp");
+
+    EXPECT_THROW(SafeKeeping::setLinuxVaultRootName("bad/root"), std::invalid_argument);
+
+    SafeKeeping::setLinuxVaultRootName(original);
+#else
+    GTEST_SKIP() << "Linux-only configuration";
+#endif
+}
+
+#if defined(__linux__) || defined(__unix__)
+TEST(SafeKeepingAcceptance, RealSystemVaultEntryIsStoredWithExpectedMetadata) {
+    if (!envFlagEnabled("SAFEKEEPING_ACCEPT_REAL_WALLET")) {
+        GTEST_SKIP() << "SAFEKEEPING_ACCEPT_REAL_WALLET=1 is required";
+    }
+
+    unsetEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR");
+    unsetEnvVar("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
+
+    const fs::path root = fs::temp_directory_path() / uniqueName("safekeeping-acceptance");
+    setEnvVar("SAFEKEEPING_DATA_DIR", root);
+
+    const std::string namespaceName = uniqueName("real_wallet");
+    const std::string expectedRoot = SafeKeeping::linuxVaultRootName();
+    const std::string expectedEntry = namespaceName + "/namespace-vault-material";
+
+    auto cleanup = [&]() {
+        SafeKeeping::removeNamespace(namespaceName);
+        unsetEnvVar("SAFEKEEPING_DATA_DIR");
+        std::error_code ignored;
+        fs::remove_all(root, ignored);
+    };
+
+    cleanup();
+
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = true;
+    options.passphrase = std::string("acceptance-passphrase");
+
+    auto created = SafeKeeping::createNew(namespaceName, options);
+    ASSERT_NE(created.instance, nullptr);
+    ASSERT_TRUE(created.instance->hasSystemVaultSlot());
+    ASSERT_TRUE(created.instance->lock());
+
+    auto reopened = SafeKeeping::open(namespaceName);
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_TRUE(reopened->isUnlocked());
+    EXPECT_TRUE(reopened->hasSystemVaultSlot());
+
+    if (const auto namespaceFile = envString("SAFEKEEPING_ACCEPT_NAMESPACE_FILE"); namespaceFile.has_value()) {
+        std::ofstream out(*namespaceFile, std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        out << namespaceName << "\n";
+        out << expectedRoot << "\n";
+        out << expectedEntry << "\n";
+    }
+
+    std::cout << "SAFEKEEPING_ACCEPT_NAMESPACE=" << namespaceName << "\n";
+    std::cout << "SAFEKEEPING_ACCEPT_ROOT=" << expectedRoot << "\n";
+    std::cout << "SAFEKEEPING_ACCEPT_ENTRY=" << expectedEntry << "\n";
+
+    EXPECT_EQ(reopened->namespaceName(), namespaceName);
+    EXPECT_TRUE(reopened->removeSecret("missing") == false);
+    EXPECT_EQ(reopened->latestError().error, SafeKeeping::Error::NotFound);
+    EXPECT_TRUE(reopened->lock());
+
+    if (envFlagEnabled("SAFEKEEPING_ACCEPT_CLEANUP")) {
+        cleanup();
+    } else {
+        unsetEnvVar("SAFEKEEPING_DATA_DIR");
+    }
+}
+#endif
