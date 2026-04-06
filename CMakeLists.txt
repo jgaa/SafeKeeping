@@ -9,6 +9,12 @@ option(SAFEKEEPING_BUILD_TESTS "Build the tests" ON)
 
 find_package(SQLite3 REQUIRED)
 
+find_package(SQLite3 REQUIRED)
+
+if(NOT TARGET SQLite3::SQLite3 AND TARGET SQLite::SQLite3)
+    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
+
 find_path(SODIUM_INCLUDE_DIR sodium.h)
 find_library(SODIUM_LIBRARY NAMES sodium libsodium)
 
