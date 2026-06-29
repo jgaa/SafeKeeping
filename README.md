@@ -14,7 +14,7 @@ All these servers require authentication, using different methods:
 Since this tool is meant for **production environments**, I don't want credentials to be stored **in plain text on disk**.
 I needed a simple, cross-platform way to handle secrets securely.
 
-On **Linux**, the library uses `libsecret`, which talks to the desktop Secret Service implementation.
+On **Linux**, the library uses `libsecret` by default and can optionally use a dedicated `KWallet` backend when built with KDE wallet support.
 
 ## **Status**
 
@@ -24,7 +24,7 @@ Beta
 
 | Platform          | Status                                     |
 | ----------------- | ------------------------------------------ |
-| **Linux (KDE)**   | ✅ Works through Secret Service              |
+| **Linux (KDE)**   | ✅ Works with KWallet or Secret Service     |
 | **Linux (GNOME)** | ✅ Works with GNOME Keyring (GNOME Desktop) |
 | **macOS**         | ✅ Works (Keychain Services)                |
 | **Windows 10**    | ✅ Works (Credential Manager)               |
@@ -44,7 +44,9 @@ However, Windows Credential Manager has a 512-byte limit on secrets, so I was un
 In the current version of this library, the actual secrets are stored as encrypted blobs in a local SQLite database.
 Only the decryption key is stored (per namespace) in the system’s vault.
 
-On Linux, the current design stores one vault item per namespace unlock slot rather than one vault item per secret. That item is stored through `libsecret`.
+On Linux, the current design stores one vault item per namespace unlock slot rather than one vault item per secret. That item is stored through the selected Linux vault backend.
+
+KWallet needs its own backend because KDE Wallet is not just a drop-in `libsecret` target in all deployments. KDE exposes a native wallet API with its own collection and access model, and this library now needs deterministic backend selection so a namespace created under KWallet keeps using KWallet after initialization. Without a dedicated backend, KDE-specific selection and backend pinning would not be reliable.
 
 By default, the Linux vault root name is `com.jgaa.SafeKeeping`. Applications can override it during startup with `SafeKeeping::setLinuxVaultRootName(...)` to avoid collisions or to group entries under an application-specific service name.
 
@@ -70,7 +72,7 @@ Build-time dependencies:
 
 Platform dependencies:
 
-* Linux: `libsecret`
+* Linux: `libsecret` always, plus optional `KF6Wallet` development files when building with `-DSAFEKEEPING_ENABLE_KWALLET=ON` on Linux.
 * macOS: Security / CoreFoundation frameworks
 * Windows: Credential Manager / `Advapi32`
 
@@ -80,6 +82,12 @@ Minimum practical install:
 
 ```bash
 sudo pacman -S --needed base-devel cmake ninja git sqlite libsodium libsecret gtest
+```
+
+If you want to build with `KWallet` support enabled:
+
+```bash
+sudo pacman -S --needed kwallet
 ```
 
 For a Linux vault provider, install one of:
@@ -110,6 +118,12 @@ sudo apt install -y build-essential cmake ninja-build pkg-config git \
     libsqlite3-dev libsodium-dev libsecret-1-dev libgtest-dev
 ```
 
+If you want to build with `KWallet` support enabled:
+
+```bash
+sudo apt install -y libkf6wallet-dev
+```
+
 For a Linux vault provider at runtime, install one of:
 
 ```bash
@@ -130,6 +144,12 @@ Current Ubuntu LTS releases use the same core development package names as Debia
 sudo apt update
 sudo apt install -y build-essential cmake ninja-build pkg-config git \
     libsqlite3-dev libsodium-dev libsecret-1-dev libgtest-dev
+```
+
+If you want to build with `KWallet` support enabled:
+
+```bash
+sudo apt install -y libkf6wallet-dev
 ```
 
 For a Linux vault provider at runtime, install one of:
@@ -153,6 +173,12 @@ sudo dnf install -y gcc-c++ cmake ninja-build pkgconf-pkg-config git \
     sqlite-devel libsodium-devel libsecret-devel gtest-devel
 ```
 
+If you want to build with `KWallet` support enabled:
+
+```bash
+sudo dnf install -y kwallet-devel
+```
+
 For a Linux vault provider at runtime, install one of:
 
 ```bash
@@ -171,6 +197,12 @@ sudo dnf install -y kwallet
 cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build --output-on-failure
+```
+
+To disable the optional KDE wallet backend at configure time:
+
+```bash
+cmake -S . -B build -G Ninja -DSAFEKEEPING_ENABLE_KWALLET=OFF
 ```
 
 ## Public API

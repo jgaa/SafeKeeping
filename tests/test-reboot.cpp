@@ -66,6 +66,29 @@ void execSql(const fs::path& dbPath, const char* sql) {
     sqlite3_close(db);
 }
 
+std::optional<std::string> querySingleText(const fs::path& dbPath, const char* sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(dbPath.string().c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        return std::nullopt;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        return std::nullopt;
+    }
+
+    std::optional<std::string> value;
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        value = text != nullptr ? std::optional<std::string>(text) : std::nullopt;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return value;
+}
+
 } // namespace
 
 class SafeKeepingRebootTest : public ::testing::Test {
@@ -75,16 +98,20 @@ protected:
         vaultRoot_ = root_ / "fake-vault";
         fs::create_directories(root_);
         SafeKeeping::setLinuxVaultRootName("com.jgaa.SafeKeeping");
+        SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::Auto);
         setEnvVar("SAFEKEEPING_DATA_DIR", root_);
         setEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR", vaultRoot_);
         unsetEnvVar("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
+        unsetEnvVar("XDG_CURRENT_DESKTOP");
     }
 
     void TearDown() override {
         SafeKeeping::setLinuxVaultRootName("com.jgaa.SafeKeeping");
+        SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::Auto);
         unsetEnvVar("SAFEKEEPING_DATA_DIR");
         unsetEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR");
         unsetEnvVar("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
+        unsetEnvVar("XDG_CURRENT_DESKTOP");
         std::error_code ignored;
         fs::remove_all(root_, ignored);
     }
@@ -374,6 +401,84 @@ TEST_F(SafeKeepingRebootTest, LinuxVaultRootNameCanBeConfigured) {
     SafeKeeping::setLinuxVaultRootName(original);
 #else
     GTEST_SKIP() << "Linux-only configuration";
+#endif
+}
+
+TEST_F(SafeKeepingRebootTest, LinuxVaultBackendOverrideControlsNewNamespaces) {
+#if defined(__linux__) || defined(__unix__)
+    setEnvVar("XDG_CURRENT_DESKTOP", "KDE");
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::LibSecret);
+
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = true;
+    options.passphrase = std::string("pw");
+    auto created = SafeKeeping::createNew("backend_override", options);
+    ASSERT_NE(created.instance, nullptr);
+
+    const auto backend = querySingleText(namespaceDbPath(root_, "backend_override"),
+                                         "SELECT system_vault_backend FROM metadata LIMIT 1");
+    ASSERT_TRUE(backend.has_value());
+    EXPECT_EQ(*backend, "libsecret");
+#else
+    GTEST_SKIP() << "Linux-only backend selection";
+#endif
+}
+
+TEST_F(SafeKeepingRebootTest, LinuxSystemVaultBackendIsPinnedAfterInitialization) {
+#if defined(__linux__) || defined(__unix__)
+    setEnvVar("XDG_CURRENT_DESKTOP", "KDE");
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::Auto);
+
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = true;
+    options.passphrase = std::string("pw");
+    auto created = SafeKeeping::createNew("backend_pinned", options);
+    ASSERT_NE(created.instance, nullptr);
+    ASSERT_TRUE(created.instance->lock());
+
+    const auto backend = querySingleText(namespaceDbPath(root_, "backend_pinned"),
+                                         "SELECT system_vault_backend FROM metadata LIMIT 1");
+    ASSERT_TRUE(backend.has_value());
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+    EXPECT_EQ(*backend, "kwallet");
+#else
+    EXPECT_EQ(*backend, "libsecret");
+#endif
+
+    unsetEnvVar("XDG_CURRENT_DESKTOP");
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::LibSecret);
+    auto reopened = SafeKeeping::open("backend_pinned");
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_TRUE(reopened->isUnlocked());
+#else
+    GTEST_SKIP() << "Linux-only backend selection";
+#endif
+}
+
+TEST_F(SafeKeepingRebootTest, LegacyLinuxNamespacesPersistBackendOnFirstVaultUnlock) {
+#if defined(__linux__) || defined(__unix__)
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::LibSecret);
+
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = true;
+    options.passphrase = std::string("pw");
+    auto created = SafeKeeping::createNew("legacy_backend", options);
+    ASSERT_NE(created.instance, nullptr);
+    ASSERT_TRUE(created.instance->lock());
+
+    execSql(namespaceDbPath(root_, "legacy_backend"),
+            "UPDATE metadata SET schema_version = 1, system_vault_backend = NULL;");
+
+    auto reopened = SafeKeeping::open("legacy_backend");
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_TRUE(reopened->isUnlocked());
+
+    const auto backend = querySingleText(namespaceDbPath(root_, "legacy_backend"),
+                                         "SELECT system_vault_backend FROM metadata LIMIT 1");
+    ASSERT_TRUE(backend.has_value());
+    EXPECT_EQ(*backend, "libsecret");
+#else
+    GTEST_SKIP() << "Linux-only backend selection";
 #endif
 }
 

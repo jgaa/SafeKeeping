@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(SAFEKEEPING_BUILD_TESTS "Build the tests" ON)
+option(SAFEKEEPING_ENABLE_KWALLET "Enable the Linux KWallet system-vault backend" ON)
 
 find_package(SQLite3 REQUIRED)
 
@@ -54,6 +55,12 @@ elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SECRET REQUIRED IMPORTED_TARGET libsecret-1)
     target_link_libraries(safekeeping PRIVATE PkgConfig::SECRET)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND SAFEKEEPING_ENABLE_KWALLET)
+        find_package(KF6Wallet REQUIRED)
+        target_link_libraries(safekeeping PRIVATE KF6::Wallet)
+        target_compile_definitions(safekeeping PRIVATE SAFEKEEPING_ENABLE_KWALLET=1)
+    endif()
 endif()
 
 install(FILES

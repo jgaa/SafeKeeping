@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,11 @@
 #include <Security/Security.h>
 #elif defined(__linux__) || defined(__unix__)
 #include <libsecret/secret.h>
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+#include <QCoreApplication>
+#include <QString>
+#include <KF6/KWallet/kwallet.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
@@ -47,7 +53,8 @@ CREATE TABLE IF NOT EXISTS metadata (
     schema_version INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    namespace_name TEXT NOT NULL
+    namespace_name TEXT NOT NULL,
+    system_vault_backend TEXT
 );
 
 CREATE TABLE IF NOT EXISTS key_slots (
@@ -78,7 +85,7 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 )sql";
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 constexpr std::string_view kDbFileName = "vault.db";
 constexpr std::string_view kVaultEntryName = "namespace-vault-material";
 constexpr std::string_view kSlotStatusActive = "active";
@@ -87,6 +94,8 @@ constexpr std::string_view kSlotTypePassphrase = "passphrase";
 constexpr std::string_view kSlotTypeRecovery = "recovery";
 constexpr std::size_t kMaxSecretSize = 10 * 1024;
 constexpr std::string_view kDefaultLinuxVaultRootName = "com.jgaa.SafeKeeping";
+constexpr std::string_view kLinuxVaultBackendLibSecret = "libsecret";
+constexpr std::string_view kLinuxVaultBackendKWallet = "kwallet";
 
 class OperationError : public std::runtime_error {
 public:
@@ -217,6 +226,56 @@ public:
     return {};
 }
 
+[[nodiscard]] std::optional<std::string> envString(const char* name) {
+    if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+        return std::string(value);
+    }
+    return std::nullopt;
+}
+
+#if defined(__linux__) || defined(__unix__)
+[[nodiscard]] bool containsCaseInsensitive(std::string_view text, std::string_view needle) {
+    auto toLowerString = [](std::string_view value) {
+        std::string out;
+        out.reserve(value.size());
+        for (const unsigned char ch : value) {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+        }
+        return out;
+    };
+    return toLowerString(text).find(toLowerString(needle)) != std::string::npos;
+}
+
+[[nodiscard]] bool isKdeDesktopSession() {
+    if (const auto currentDesktop = envString("XDG_CURRENT_DESKTOP");
+        currentDesktop.has_value() && containsCaseInsensitive(*currentDesktop, "kde")) {
+        return true;
+    }
+    if (const auto fullSession = envString("KDE_FULL_SESSION");
+        fullSession.has_value() && (*fullSession == "1" || containsCaseInsensitive(*fullSession, "true"))) {
+        return true;
+    }
+    if (const auto desktopSession = envString("DESKTOP_SESSION");
+        desktopSession.has_value() && containsCaseInsensitive(*desktopSession, "kde")) {
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] std::optional<std::string> linuxVaultBackendName(
+    SafeKeeping::LinuxVaultBackend backend) {
+    switch (backend) {
+    case SafeKeeping::LinuxVaultBackend::Auto:
+        return std::nullopt;
+    case SafeKeeping::LinuxVaultBackend::LibSecret:
+        return std::string(kLinuxVaultBackendLibSecret);
+    case SafeKeeping::LinuxVaultBackend::KWallet:
+        return std::string(kLinuxVaultBackendKWallet);
+    }
+    return std::nullopt;
+}
+#endif
+
 void ensureSodium() {
     static const bool initialized = [] {
         if (sodium_init() < 0) {
@@ -263,6 +322,21 @@ void validateLinuxVaultRootName(std::string_view name) {
 [[nodiscard]] std::string linuxVaultRootName() {
     std::scoped_lock lock(linuxVaultRootMutex());
     return linuxVaultRootStorage();
+}
+
+[[nodiscard]] SafeKeeping::LinuxVaultBackend& linuxVaultBackendStorage() {
+    static SafeKeeping::LinuxVaultBackend value = SafeKeeping::LinuxVaultBackend::Auto;
+    return value;
+}
+
+[[nodiscard]] std::mutex& linuxVaultBackendMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+[[nodiscard]] SafeKeeping::LinuxVaultBackend linuxVaultBackendPreference() {
+    std::scoped_lock lock(linuxVaultBackendMutex());
+    return linuxVaultBackendStorage();
 }
 
 void validateSecretValue(byte_view secret) {
@@ -611,6 +685,71 @@ void execute(sqlite3* db, std::string_view sql) {
     }
 }
 
+[[nodiscard]] bool metadataHasColumn(sqlite3* db, std::string_view columnName) {
+    auto stmt = prepare(db, "PRAGMA table_info(metadata)");
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        if (columnText(stmt.get(), 1) == columnName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void migrateSchema(sqlite3* db) {
+    auto stmt = prepare(db, "SELECT schema_version FROM metadata LIMIT 1");
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+        throw std::runtime_error("metadata row is missing");
+    }
+    const int schemaVersion = sqlite3_column_int(stmt.get(), 0);
+    if (schemaVersion > kSchemaVersion) {
+        throw std::runtime_error("unsupported schema version");
+    }
+
+    bool changed = false;
+    if (!metadataHasColumn(db, "system_vault_backend")) {
+        execute(db, "ALTER TABLE metadata ADD COLUMN system_vault_backend TEXT");
+        changed = true;
+    }
+
+    if (schemaVersion < kSchemaVersion || changed) {
+        auto update = prepare(db, "UPDATE metadata SET schema_version = ?, updated_at = ?");
+        bindInt64(update.get(), 1, kSchemaVersion);
+        bindInt64(update.get(), 2, nowSeconds());
+        stepDone(db, update.get());
+    }
+}
+
+[[nodiscard]] std::optional<std::string> storedSystemVaultBackend(sqlite3* db) {
+    if (!metadataHasColumn(db, "system_vault_backend")) {
+        return std::nullopt;
+    }
+
+    auto stmt = prepare(db, "SELECT system_vault_backend FROM metadata LIMIT 1");
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW || sqlite3_column_type(stmt.get(), 0) == SQLITE_NULL) {
+        return std::nullopt;
+    }
+    const auto value = columnText(stmt.get(), 0);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+void setStoredSystemVaultBackend(sqlite3* db, std::optional<std::string_view> backendName) {
+    if (!metadataHasColumn(db, "system_vault_backend")) {
+        throw std::runtime_error("metadata column system_vault_backend is missing");
+    }
+
+    auto stmt = prepare(db, "UPDATE metadata SET system_vault_backend = ?, updated_at = ?");
+    if (backendName.has_value()) {
+        bindText(stmt.get(), 1, *backendName);
+    } else if (sqlite3_bind_null(stmt.get(), 1) != SQLITE_OK) {
+        throw std::runtime_error("failed to bind null text");
+    }
+    bindInt64(stmt.get(), 2, nowSeconds());
+    stepDone(db, stmt.get());
+}
+
 class FileVaultBackend final : public VaultBackend {
 public:
     explicit FileVaultBackend(std::filesystem::path root) : root_(std::move(root)) {}
@@ -759,6 +898,156 @@ private:
         return linuxVaultRootName() + "/" + accountName(namespaceName, key);
     }
 };
+
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+class KWalletVaultBackend final : public VaultBackend {
+public:
+    bool available() const override {
+        return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT") &&
+            QCoreApplication::instance() != nullptr &&
+            KWallet::Wallet::isEnabled();
+    }
+
+    bool store(std::string_view namespaceName, std::string_view key, std::string_view value) override {
+        auto wallet = openWallet();
+        if (wallet == nullptr) {
+            return false;
+        }
+        if (!prepareFolder(*wallet)) {
+            return false;
+        }
+        return wallet->writePassword(QString::fromUtf8(accountName(namespaceName, key)), QString::fromUtf8(value)) == 0;
+    }
+
+    std::optional<std::string> load(std::string_view namespaceName, std::string_view key) override {
+        auto wallet = openWallet();
+        if (wallet == nullptr) {
+            return std::nullopt;
+        }
+        if (!prepareFolder(*wallet)) {
+            return std::nullopt;
+        }
+
+        QString value;
+        if (wallet->readPassword(QString::fromUtf8(accountName(namespaceName, key)), value) != 0) {
+            return std::nullopt;
+        }
+        return value.toUtf8().toStdString();
+    }
+
+    bool remove(std::string_view namespaceName, std::string_view key) override {
+        auto wallet = openWallet();
+        if (wallet == nullptr) {
+            return false;
+        }
+        if (!prepareFolder(*wallet)) {
+            return false;
+        }
+        return wallet->removeEntry(QString::fromUtf8(accountName(namespaceName, key))) == 0;
+    }
+
+private:
+    static std::unique_ptr<KWallet::Wallet> openWallet() {
+        if (!QCoreApplication::instance()) {
+            return {};
+        }
+        return std::unique_ptr<KWallet::Wallet>(
+            KWallet::Wallet::openWallet(KWallet::Wallet::NetworkWallet(), 0, KWallet::Wallet::Synchronous));
+    }
+
+    static bool prepareFolder(KWallet::Wallet& wallet) {
+        const auto rootName = linuxVaultRootName();
+        const QString folder = QString::fromUtf8(rootName.c_str());
+        if (!wallet.hasFolder(folder) && !wallet.createFolder(folder)) {
+            return false;
+        }
+        return wallet.setFolder(folder);
+    }
+
+    static QByteArray accountName(std::string_view namespaceName, std::string_view key) {
+        return QByteArray::fromStdString(toString(namespaceName) + "/" + toString(key));
+    }
+};
+#endif
+
+struct LinuxVaultBackendSelection {
+    std::unique_ptr<VaultBackend> backend;
+    std::optional<std::string> backendName;
+};
+
+[[nodiscard]] LinuxVaultBackendSelection selectLinuxVaultBackend(std::optional<std::string> pinnedBackendName = std::nullopt) {
+    if (const auto fakeVault = pathFromEnv("SAFEKEEPING_TEST_FAKE_VAULT_DIR"); !fakeVault.empty()) {
+        std::optional<std::string> backendName = pinnedBackendName;
+        if (!backendName.has_value()) {
+            backendName = linuxVaultBackendName(linuxVaultBackendPreference());
+            if (!backendName.has_value()) {
+                if (isKdeDesktopSession()) {
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+                    backendName = std::string(kLinuxVaultBackendKWallet);
+#endif
+                }
+            }
+            if (!backendName.has_value()) {
+                backendName = std::string(kLinuxVaultBackendLibSecret);
+            }
+        }
+        return {.backend = std::make_unique<FileVaultBackend>(fakeVault), .backendName = std::move(backendName)};
+    }
+
+    if (pinnedBackendName.has_value()) {
+        if (*pinnedBackendName == kLinuxVaultBackendLibSecret) {
+            return {.backend = std::make_unique<LibSecretVaultBackend>(), .backendName = pinnedBackendName};
+        }
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+        if (*pinnedBackendName == kLinuxVaultBackendKWallet) {
+            return {.backend = std::make_unique<KWalletVaultBackend>(), .backendName = pinnedBackendName};
+        }
+#endif
+        return {.backend = std::make_unique<FileVaultBackend>(std::filesystem::path{}),
+                .backendName = pinnedBackendName};
+    }
+
+    switch (linuxVaultBackendPreference()) {
+    case SafeKeeping::LinuxVaultBackend::LibSecret:
+        return {.backend = std::make_unique<LibSecretVaultBackend>(),
+                .backendName = std::string(kLinuxVaultBackendLibSecret)};
+    case SafeKeeping::LinuxVaultBackend::KWallet:
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+        return {.backend = std::make_unique<KWalletVaultBackend>(),
+                .backendName = std::string(kLinuxVaultBackendKWallet)};
+#else
+        return {.backend = std::make_unique<FileVaultBackend>(std::filesystem::path{}),
+                .backendName = std::string(kLinuxVaultBackendKWallet)};
+#endif
+    case SafeKeeping::LinuxVaultBackend::Auto:
+        break;
+    }
+
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+    if (isKdeDesktopSession()) {
+        auto kwallet = std::make_unique<KWalletVaultBackend>();
+        if (kwallet->available()) {
+            return {.backend = std::move(kwallet), .backendName = std::string(kLinuxVaultBackendKWallet)};
+        }
+    }
+#endif
+
+    auto libsecret = std::make_unique<LibSecretVaultBackend>();
+    if (libsecret->available()) {
+        return {.backend = std::move(libsecret), .backendName = std::string(kLinuxVaultBackendLibSecret)};
+    }
+
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+    if (!isKdeDesktopSession()) {
+        auto kwallet = std::make_unique<KWalletVaultBackend>();
+        if (kwallet->available()) {
+            return {.backend = std::move(kwallet), .backendName = std::string(kLinuxVaultBackendKWallet)};
+        }
+    }
+#endif
+
+    return {.backend = std::move(libsecret), .backendName = std::string(kLinuxVaultBackendLibSecret)};
+}
 #elif defined(__APPLE__)
 class MacVaultBackend final : public VaultBackend {
 public:
@@ -916,18 +1205,27 @@ private:
 };
 #endif
 
-std::unique_ptr<VaultBackend> makeVaultBackend() {
+struct VaultBackendSelection {
+    std::unique_ptr<VaultBackend> backend;
+    std::optional<std::string> backendName;
+};
+
+[[nodiscard]] VaultBackendSelection makeVaultBackend(std::optional<std::string> pinnedBackendName = std::nullopt) {
+#if defined(__linux__) || defined(__unix__)
+    auto selection = selectLinuxVaultBackend(std::move(pinnedBackendName));
+    return {.backend = std::move(selection.backend), .backendName = std::move(selection.backendName)};
+#else
     if (const auto fakeVault = pathFromEnv("SAFEKEEPING_TEST_FAKE_VAULT_DIR"); !fakeVault.empty()) {
-        return std::make_unique<FileVaultBackend>(fakeVault);
+        return {.backend = std::make_unique<FileVaultBackend>(fakeVault), .backendName = std::nullopt};
     }
 #if defined(__linux__) || defined(__unix__)
-    return std::make_unique<LibSecretVaultBackend>();
 #elif defined(__APPLE__)
-    return std::make_unique<MacVaultBackend>();
+    return {.backend = std::make_unique<MacVaultBackend>(), .backendName = std::nullopt};
 #elif defined(_WIN32)
-    return std::make_unique<WinVaultBackend>();
+    return {.backend = std::make_unique<WinVaultBackend>(), .backendName = std::nullopt};
 #else
-    return std::make_unique<FileVaultBackend>(std::filesystem::path{});
+    return {.backend = std::make_unique<FileVaultBackend>(std::filesystem::path{}), .backendName = std::nullopt};
+#endif
 #endif
 }
 
@@ -1076,16 +1374,21 @@ void initializeSchema(sqlite3* db, std::string_view namespaceName) {
 
     auto insert = prepare(
         db,
-        "INSERT INTO metadata (schema_version, created_at, updated_at, namespace_name) VALUES (?, ?, ?, ?)");
+        "INSERT INTO metadata (schema_version, created_at, updated_at, namespace_name, system_vault_backend) "
+        "VALUES (?, ?, ?, ?, ?)");
     const auto now = nowSeconds();
     bindInt64(insert.get(), 1, kSchemaVersion);
     bindInt64(insert.get(), 2, now);
     bindInt64(insert.get(), 3, now);
     bindText(insert.get(), 4, namespaceName);
+    if (sqlite3_bind_null(insert.get(), 5) != SQLITE_OK) {
+        throw std::runtime_error("failed to bind null text");
+    }
     stepDone(db, insert.get());
 }
 
 void validateSchema(sqlite3* db, std::string_view namespaceName) {
+    migrateSchema(db);
     auto stmt = prepare(db, "SELECT schema_version, namespace_name FROM metadata LIMIT 1");
     if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
         throw std::runtime_error("metadata row is missing");
@@ -1129,11 +1432,13 @@ public:
     Impl(std::string namespaceName,
          sqlite_ptr db,
          std::filesystem::path dbPath,
-         std::unique_ptr<VaultBackend> vaultBackend)
+         std::unique_ptr<VaultBackend> vaultBackend,
+         std::optional<std::string> vaultBackendName)
         : namespaceName_(std::move(namespaceName)),
           db_(std::move(db)),
           dbPath_(std::move(dbPath)),
-          vaultBackend_(std::move(vaultBackend)) {}
+          vaultBackend_(std::move(vaultBackend)),
+          vaultBackendName_(std::move(vaultBackendName)) {}
 
     ~Impl() {
         lock();
@@ -1146,8 +1451,9 @@ public:
             throw std::runtime_error("namespace already exists");
         }
 
-        auto vaultBackend = makeVaultBackend();
-        const bool vaultAvailable = vaultBackend != nullptr && vaultBackend->available();
+        auto vaultBackendSelection = makeVaultBackend();
+        const bool vaultAvailable = vaultBackendSelection.backend != nullptr &&
+            vaultBackendSelection.backend->available();
         if (!vaultAvailable && !options.passphrase.has_value() &&
             options.requireAtLeastOneUnlockMethod) {
             throw std::runtime_error("no usable unlock method is available");
@@ -1163,8 +1469,8 @@ public:
 
             if (options.createSystemVaultSlot && vaultAvailable) {
                 const std::string vaultMaterial = bytesToHex(randomBytes(32));
-                if (!vaultBackend->store(namespaceName, kVaultEntryName, vaultMaterial)) {
-                    const std::string detail = vaultBackend->lastErrorMessage();
+                if (!vaultBackendSelection.backend->store(namespaceName, kVaultEntryName, vaultMaterial)) {
+                    const std::string detail = vaultBackendSelection.backend->lastErrorMessage();
                     throw std::runtime_error(
                         detail.empty() ? "failed to store vault material"
                                        : "failed to store vault material: " + detail);
@@ -1179,6 +1485,7 @@ public:
                                             std::nullopt,
                                             0,
                                             0));
+                setStoredSystemVaultBackend(db.get(), vaultBackendSelection.backendName);
             }
 
             if (options.passphrase.has_value()) {
@@ -1225,7 +1532,11 @@ public:
             txn.commit();
             lockDownDatabaseArtifacts(dbPath);
 
-            auto impl = std::make_unique<Impl>(namespaceName, std::move(db), dbPath, std::move(vaultBackend));
+            auto impl = std::make_unique<Impl>(namespaceName,
+                                               std::move(db),
+                                               dbPath,
+                                               std::move(vaultBackendSelection.backend),
+                                               std::move(vaultBackendSelection.backendName));
             impl->dek_ = dek;
             impl->unlocked_ = true;
             return {.instance = std::unique_ptr<SafeKeeping>(new SafeKeeping(std::move(impl))),
@@ -1233,7 +1544,7 @@ public:
         } catch (...) {
             std::error_code ignored;
             if (vaultAvailable) {
-                vaultBackend->remove(namespaceName, kVaultEntryName);
+                vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
             }
             std::filesystem::remove_all(dbPath.parent_path(), ignored);
             throw;
@@ -1250,7 +1561,12 @@ public:
         auto db = openDatabase(dbPath, false);
         validateSchema(db.get(), namespaceName);
 
-        auto impl = std::make_unique<Impl>(namespaceName, std::move(db), dbPath, makeVaultBackend());
+        auto vaultBackendSelection = makeVaultBackend(storedSystemVaultBackend(db.get()));
+        auto impl = std::make_unique<Impl>(namespaceName,
+                                           std::move(db),
+                                           dbPath,
+                                           std::move(vaultBackendSelection.backend),
+                                           std::move(vaultBackendSelection.backendName));
         auto result = std::unique_ptr<SafeKeeping>(new SafeKeeping(std::move(impl)));
 
         if (options.trySystemVaultFirst) {
@@ -1273,9 +1589,33 @@ public:
         validateNamespaceOrSecretName(namespaceName, "namespace");
         const auto dbPath = databasePath(namespaceName);
         const bool dbExists = std::filesystem::exists(dbPath);
-        const auto vaultBackend = makeVaultBackend();
-        if (vaultBackend != nullptr && vaultBackend->available()) {
-            vaultBackend->remove(namespaceName, kVaultEntryName);
+        if (dbExists) {
+            auto db = openDatabase(dbPath, false);
+            validateSchema(db.get(), namespaceName);
+            if (const auto pinnedBackend = storedSystemVaultBackend(db.get()); pinnedBackend.has_value()) {
+                auto vaultBackendSelection = makeVaultBackend(pinnedBackend);
+                if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
+                    vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                }
+            } else {
+#if defined(__linux__) || defined(__unix__)
+                for (const auto& backendName : {std::string(kLinuxVaultBackendLibSecret)
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+                    , std::string(kLinuxVaultBackendKWallet)
+#endif
+                }) {
+                    auto vaultBackendSelection = makeVaultBackend(backendName);
+                    if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
+                        vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                    }
+                }
+#else
+                auto vaultBackendSelection = makeVaultBackend();
+                if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
+                    vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                }
+#endif
+            }
         }
         std::error_code error;
         std::filesystem::remove_all(dbPath.parent_path(), error);
@@ -1301,7 +1641,33 @@ public:
             fail(Error::VaultError, "system vault backend is not available");
         }
 
-        const auto material = vaultBackend_->load(namespaceName_, kVaultEntryName);
+        auto material = vaultBackend_->load(namespaceName_, kVaultEntryName);
+#if defined(__linux__) || defined(__unix__)
+        if (!material.has_value() &&
+            !storedSystemVaultBackend(db_.get()).has_value() &&
+            linuxVaultBackendPreference() == SafeKeeping::LinuxVaultBackend::Auto) {
+            for (const auto& backendName : {std::string(kLinuxVaultBackendLibSecret)
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+                , std::string(kLinuxVaultBackendKWallet)
+#endif
+            }) {
+                if (vaultBackendName_.has_value() && *vaultBackendName_ == backendName) {
+                    continue;
+                }
+                auto fallbackBackendSelection = makeVaultBackend(backendName);
+                if (fallbackBackendSelection.backend == nullptr ||
+                    !fallbackBackendSelection.backend->available()) {
+                    continue;
+                }
+                material = fallbackBackendSelection.backend->load(namespaceName_, kVaultEntryName);
+                if (material.has_value()) {
+                    vaultBackend_ = std::move(fallbackBackendSelection.backend);
+                    vaultBackendName_ = std::move(fallbackBackendSelection.backendName);
+                    break;
+                }
+            }
+        }
+#endif
         if (!material.has_value()) {
             fail(Error::VaultError, "failed to load namespace material from the system vault");
         }
@@ -1310,6 +1676,17 @@ public:
             const auto slot = readSingleSlot(db_.get(), kSlotTypeVault);
             const auto dek = unwrapDek(slot, deriveVaultKek(*material), "schema-1");
             setUnlockedDek(dek);
+#if defined(__linux__) || defined(__unix__)
+            if (!vaultBackendName_.has_value()) {
+                vaultBackendName_ = storedSystemVaultBackend(db_.get());
+            }
+            if (!vaultBackendName_.has_value()) {
+                fail(Error::DataCorrupted, "system vault backend could not be determined");
+            }
+            if (!storedSystemVaultBackend(db_.get()).has_value()) {
+                setStoredSystemVaultBackend(db_.get(), vaultBackendName_);
+            }
+#endif
             return true;
         } catch (const OperationError&) {
             throw;
@@ -1578,7 +1955,14 @@ public:
                                     std::nullopt,
                                     0,
                                     0));
+#if defined(__linux__) || defined(__unix__)
+        if (!vaultBackendName_.has_value()) {
+            fail(Error::VaultError, "system vault backend is not available");
+        }
+        setStoredSystemVaultBackend(db_.get(), vaultBackendName_);
+#else
         updateMetadataTimestamp();
+#endif
         txn.commit();
         return true;
     }
@@ -1735,6 +2119,7 @@ private:
     sqlite_ptr db_;
     std::filesystem::path dbPath_;
     std::unique_ptr<VaultBackend> vaultBackend_;
+    std::optional<std::string> vaultBackendName_;
     bytes dek_;
     bool unlocked_ = false;
     mutable LatestError lastError_;
@@ -1830,6 +2215,15 @@ void SafeKeeping::setLinuxVaultRootName(std::string name) {
 
 std::string SafeKeeping::linuxVaultRootName() {
     return jgaa::safekeeping::linuxVaultRootName();
+}
+
+void SafeKeeping::setLinuxVaultBackend(LinuxVaultBackend backend) {
+    std::scoped_lock lock(linuxVaultBackendMutex());
+    linuxVaultBackendStorage() = backend;
+}
+
+SafeKeeping::LinuxVaultBackend SafeKeeping::linuxVaultBackend() {
+    return linuxVaultBackendPreference();
 }
 
 bool SafeKeeping::exists(std::string_view namespaceName) {

@@ -109,6 +109,16 @@ public:
         RecoveryKey,
     };
 
+    /** @brief Linux system-vault backend preference. */
+    enum class LinuxVaultBackend {
+        /** Automatically choose the backend for the current environment. */
+        Auto,
+        /** Use the libsecret backend. */
+        LibSecret,
+        /** Use the KWallet backend. */
+        KWallet,
+    };
+
     /** @brief List of secret metadata entries. */
     using info_list_t = std::vector<Info>;
 
@@ -185,6 +195,22 @@ public:
      * @return The current Linux vault root name.
      */
     [[nodiscard]] static std::string linuxVaultRootName();
+    /**
+     * @brief Set the preferred Linux system-vault backend.
+     *
+     * `Auto` is the default. When KWallet support is compiled in, `Auto`
+     * prefers KWallet under KDE and otherwise prefers libsecret. Existing
+     * namespaces continue using the backend recorded when their system-vault
+     * slot was initialized.
+     *
+     * @param backend Preferred Linux backend selection policy.
+     */
+    static void setLinuxVaultBackend(LinuxVaultBackend backend);
+    /**
+     * @brief Get the preferred Linux system-vault backend policy.
+     * @return The current Linux backend preference.
+     */
+    [[nodiscard]] static LinuxVaultBackend linuxVaultBackend();
     /**
      * @brief Check whether a namespace database exists.
      * @param namespaceName Namespace identifier.

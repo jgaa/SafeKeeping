@@ -5,6 +5,9 @@ find_package(Threads REQUIRED)
 
 add_executable(test_reboot test-reboot.cpp)
 target_link_libraries(test_reboot PRIVATE safekeeping GTest::GTest GTest::Main Threads::Threads)
+if(SAFEKEEPING_ENABLE_KWALLET)
+    target_compile_definitions(test_reboot PRIVATE SAFEKEEPING_ENABLE_KWALLET=1)
+endif()
 
 add_test(NAME TestReboot COMMAND test_reboot)
 
