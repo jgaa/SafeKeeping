@@ -29,6 +29,7 @@ Beta
 | **macOS**         | ✅ Works (Keychain Services)                |
 | **Windows 10**    | ✅ Works (Credential Manager)               |
 | **Windows 11**    | ✅ Works (Credential Manager)               |
+| **Android**       | ⚠️ First iteration: NDK-only file backend   |
 
 ## Storage Model
 
@@ -37,6 +38,7 @@ Each namespace lives under the user’s application data directory as:
 * Linux: `~/.local/share/safekeeping/<namespace>/vault.db` unless `XDG_DATA_HOME` is set
 * macOS: `~/Library/Application Support/safekeeping/<namespace>/vault.db`
 * Windows: `%APPDATA%/safekeeping/<namespace>/vault.db`
+* Android: `$SAFEKEEPING_DATA_DIR/<namespace>/...` when set, otherwise `$HOME/files/safekeeping/<namespace>/...`
 
 Originally, the library stored secrets in the system's vault.
 However, Windows Credential Manager has a 512-byte limit on secrets, so I was unable to store some PKI certificates, which I normally use for authentication.
@@ -75,6 +77,7 @@ Platform dependencies:
 * Linux: `libsecret` always, plus optional `KF6Wallet` development files when building with `-DSAFEKEEPING_ENABLE_KWALLET=ON` on Linux.
 * macOS: Security / CoreFoundation frameworks
 * Windows: Credential Manager / `Advapi32`
+* Android: NDK only in the current implementation
 
 ### Arch Linux
 
@@ -204,6 +207,26 @@ To disable the optional KDE wallet backend at configure time:
 ```bash
 cmake -S . -B build -G Ninja -DSAFEKEEPING_ENABLE_KWALLET=OFF
 ```
+
+## Android Notes
+
+The Android target currently builds a separate implementation that avoids `SQLite3`, `libsodium`, `libsecret`, and `KWallet`.
+
+Behavior in this first pass:
+
+* storage is file-based under the app-private area
+* secrets are not encrypted at rest in the current Android backend
+* passphrase and recovery-slot metadata are also stored locally in the app-private area
+* the "system vault" slot is currently backed by a private file, not the Android Keystore
+* tests are disabled for Android in CMake
+
+Security properties of the current Android implementation:
+
+* it protects data from ordinary access by other apps because files live in the app's private storage area
+* it does not protect data from Android itself, privileged/system-level access, device backups, forensic extraction, or a compromised/rooted device
+* it should be treated as an integration/bootstrap target, not as the final Android security model
+
+This keeps the native dependency set to the NDK for now. A later iteration can add a Kotlin/JNI bridge that sources master-key material from the Android Keystore and enables real at-rest encryption.
 
 ## Public API
 

@@ -8,24 +8,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(SAFEKEEPING_BUILD_TESTS "Build the tests" ON)
 option(SAFEKEEPING_ENABLE_KWALLET "Enable the Linux KWallet system-vault backend" ON)
 
-find_package(SQLite3 REQUIRED)
+set(SAFEKEEPING_SOURCES
+    include/safekeeping/SafeKeeping.h
+)
 
-find_package(SQLite3 REQUIRED)
+if(ANDROID)
+    list(APPEND SAFEKEEPING_SOURCES src/SafeKeepingAndroid.cpp)
+    set(SAFEKEEPING_BUILD_TESTS OFF CACHE BOOL "Build the tests" FORCE)
+else()
+    list(APPEND SAFEKEEPING_SOURCES src/SafeKeeping.cpp)
 
-if(NOT TARGET SQLite3::SQLite3 AND TARGET SQLite::SQLite3)
-    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
-endif()
+    find_package(SQLite3 REQUIRED)
 
-find_path(SODIUM_INCLUDE_DIR sodium.h)
-find_library(SODIUM_LIBRARY NAMES sodium libsodium)
+    if(NOT TARGET SQLite3::SQLite3 AND TARGET SQLite::SQLite3)
+        add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+    endif()
 
-if(NOT SODIUM_INCLUDE_DIR OR NOT SODIUM_LIBRARY)
-    message(FATAL_ERROR "libsodium was not found")
+    find_path(SODIUM_INCLUDE_DIR sodium.h)
+    find_library(SODIUM_LIBRARY NAMES sodium libsodium)
+
+    if(NOT SODIUM_INCLUDE_DIR OR NOT SODIUM_LIBRARY)
+        message(FATAL_ERROR "libsodium was not found")
+    endif()
 endif()
 
 add_library(safekeeping STATIC
-    src/SafeKeeping.cpp
-    include/safekeeping/SafeKeeping.h
+    ${SAFEKEEPING_SOURCES}
 )
 
 target_include_directories(safekeeping
@@ -33,14 +41,17 @@ target_include_directories(safekeeping
         include
     PRIVATE
         src
-        ${SODIUM_INCLUDE_DIR}
 )
 
-target_link_libraries(safekeeping
-    PRIVATE
-        ${SODIUM_LIBRARY}
-        SQLite3::SQLite3
-)
+if(NOT ANDROID)
+    target_include_directories(safekeeping PRIVATE ${SODIUM_INCLUDE_DIR})
+    target_link_libraries(
+        safekeeping
+        PRIVATE
+            ${SODIUM_LIBRARY}
+            SQLite3::SQLite3
+    )
+endif()
 
 if(WIN32)
     target_link_libraries(safekeeping PRIVATE Advapi32)
@@ -51,7 +62,7 @@ elseif(APPLE)
             "-framework Security"
             "-framework CoreFoundation"
     )
-elseif(UNIX)
+elseif(UNIX AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SECRET REQUIRED IMPORTED_TARGET libsecret-1)
     target_link_libraries(safekeeping PRIVATE PkgConfig::SECRET)
