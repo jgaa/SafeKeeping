@@ -120,6 +120,33 @@ protected:
     fs::path vaultRoot_;
 };
 
+TEST_F(SafeKeepingRebootTest, BackendIdentificationWorksWhileLocked) {
+    EXPECT_EQ(SafeKeeping::selectedSystemVaultBackendName(), "file");
+    auto created = SafeKeeping::createNew("backend_name");
+    ASSERT_NE(created.instance, nullptr);
+    EXPECT_EQ(created.instance->systemVaultBackendName(), "file");
+    ASSERT_TRUE(created.instance->lock());
+    EXPECT_EQ(created.instance->systemVaultBackendName(), "file");
+    created.instance.reset();
+    auto reopened = SafeKeeping::open("backend_name");
+    ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(reopened->systemVaultBackendName(), "file");
+}
+
+TEST_F(SafeKeepingRebootTest, BackendIdentificationReportsExplicitLinuxSelection) {
+#if defined(__linux__) || defined(__unix__)
+    unsetEnvVar("SAFEKEEPING_TEST_FAKE_VAULT_DIR");
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::LibSecret);
+    EXPECT_EQ(SafeKeeping::selectedSystemVaultBackendName(), "libsecret");
+    SafeKeeping::setLinuxVaultBackend(SafeKeeping::LinuxVaultBackend::KWallet);
+#if defined(SAFEKEEPING_ENABLE_KWALLET)
+    EXPECT_EQ(SafeKeeping::selectedSystemVaultBackendName(), "kwallet");
+#else
+    EXPECT_EQ(SafeKeeping::selectedSystemVaultBackendName(), "unavailable");
+#endif
+#endif
+}
+
 TEST_F(SafeKeepingRebootTest, PassphraseOnlyNamespaceRoundTripsAndPersists) {
     SafeKeeping::CreateOptions options;
     options.createSystemVaultSlot = false;

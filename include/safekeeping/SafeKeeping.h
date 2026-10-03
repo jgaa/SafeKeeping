@@ -212,6 +212,18 @@ public:
      */
     [[nodiscard]] static LinuxVaultBackend linuxVaultBackend();
     /**
+     * @brief Identify the system-vault backend selected for a new namespace.
+     * Existing namespaces may use a different, persisted backend.
+     * Returns file, libsecret, kwallet, macos-keychain, windows-credential-manager,
+     * android-file, or unavailable, depending on platform and configuration.
+     */
+    [[nodiscard]] static std::string selectedSystemVaultBackendName();
+    /**
+     * @brief Identify this instance's actual system-vault backend.
+     * Available even when locked. Reflects any backend fallback during unlock.
+     */
+    [[nodiscard]] std::string systemVaultBackendName() const;
+    /**
      * @brief Check whether a namespace database exists.
      * @param namespaceName Namespace identifier.
      * @return `true` if the namespace exists.

@@ -781,6 +781,14 @@ SafeKeeping::LinuxVaultBackend SafeKeeping::linuxVaultBackend() {
     return LinuxVaultBackend::Auto;
 }
 
+std::string SafeKeeping::selectedSystemVaultBackendName() {
+    return "android-file";
+}
+
+std::string SafeKeeping::systemVaultBackendName() const {
+    return "android-file";
+}
+
 bool SafeKeeping::exists(std::string_view namespaceName) {
     return Impl::exists(namespaceName);
 }

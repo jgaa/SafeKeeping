@@ -170,6 +170,7 @@ class VaultBackend {
 public:
     virtual ~VaultBackend() = default;
 
+    virtual std::string name() const = 0;
     virtual bool available() const = 0;
     virtual bool store(std::string_view namespaceName,
                        std::string_view key,
@@ -752,6 +753,8 @@ void setStoredSystemVaultBackend(sqlite3* db, std::optional<std::string_view> ba
 
 class FileVaultBackend final : public VaultBackend {
 public:
+    std::string name() const override { return root_.empty() ? "unavailable" : "file"; }
+
     explicit FileVaultBackend(std::filesystem::path root) : root_(std::move(root)) {}
 
     bool available() const override {
@@ -802,6 +805,8 @@ private:
 #if defined(__linux__) || defined(__unix__)
 class LibSecretVaultBackend final : public VaultBackend {
 public:
+    std::string name() const override { return "libsecret"; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
     }
@@ -902,6 +907,8 @@ private:
 #if defined(SAFEKEEPING_ENABLE_KWALLET)
 class KWalletVaultBackend final : public VaultBackend {
 public:
+    std::string name() const override { return "kwallet"; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT") &&
             QCoreApplication::instance() != nullptr &&
@@ -1051,6 +1058,8 @@ struct LinuxVaultBackendSelection {
 #elif defined(__APPLE__)
 class MacVaultBackend final : public VaultBackend {
 public:
+    std::string name() const override { return "macos-keychain"; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
     }
@@ -1158,6 +1167,8 @@ private:
 #elif defined(_WIN32)
 class WinVaultBackend final : public VaultBackend {
 public:
+    std::string name() const override { return "windows-credential-manager"; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
     }
@@ -1628,6 +1639,10 @@ public:
 
     bool isUnlocked() const noexcept {
         return unlocked_;
+    }
+
+    std::string systemVaultBackendName() const {
+        return vaultBackend_ ? vaultBackend_->name() : "unavailable";
     }
 
     bool unlockWithSystemVault() {
@@ -2224,6 +2239,15 @@ void SafeKeeping::setLinuxVaultBackend(LinuxVaultBackend backend) {
 
 SafeKeeping::LinuxVaultBackend SafeKeeping::linuxVaultBackend() {
     return linuxVaultBackendPreference();
+}
+
+std::string SafeKeeping::selectedSystemVaultBackendName() {
+    const auto selection = makeVaultBackend();
+    return selection.backend ? selection.backend->name() : "unavailable";
+}
+
+std::string SafeKeeping::systemVaultBackendName() const {
+    return impl_->systemVaultBackendName();
 }
 
 bool SafeKeeping::exists(std::string_view namespaceName) {
