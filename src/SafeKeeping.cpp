@@ -909,6 +909,8 @@ class KWalletVaultBackend final : public VaultBackend {
 public:
     std::string name() const override { return "kwallet"; }
 
+    std::string lastErrorMessage() const override { return lastError_; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT") &&
             QCoreApplication::instance() != nullptr &&
@@ -916,6 +918,7 @@ public:
     }
 
     bool store(std::string_view namespaceName, std::string_view key, std::string_view value) override {
+        lastError_.clear();
         auto wallet = openWallet();
         if (wallet == nullptr) {
             return false;
@@ -923,10 +926,19 @@ public:
         if (!prepareFolder(*wallet)) {
             return false;
         }
-        return wallet->writePassword(QString::fromUtf8(accountName(namespaceName, key)), QString::fromUtf8(value)) == 0;
+        const auto entry = QString::fromUtf8(accountName(namespaceName, key));
+        const int status = wallet->writePassword(entry, QString::fromUtf8(value));
+        if (status != 0) {
+            lastError_ = "KWallet writePassword failed for wallet '" + wallet->walletName().toStdString()
+                + "', folder '" + wallet->currentFolder().toStdString()
+                + "', entry '" + entry.toStdString() + "' (status " + std::to_string(status) + ")";
+            return false;
+        }
+        return true;
     }
 
     std::optional<std::string> load(std::string_view namespaceName, std::string_view key) override {
+        lastError_.clear();
         auto wallet = openWallet();
         if (wallet == nullptr) {
             return std::nullopt;
@@ -936,13 +948,19 @@ public:
         }
 
         QString value;
-        if (wallet->readPassword(QString::fromUtf8(accountName(namespaceName, key)), value) != 0) {
+        const auto entry = QString::fromUtf8(accountName(namespaceName, key));
+        const int status = wallet->readPassword(entry, value);
+        if (status != 0) {
+            lastError_ = "KWallet readPassword failed for wallet '" + wallet->walletName().toStdString()
+                + "', folder '" + wallet->currentFolder().toStdString()
+                + "', entry '" + entry.toStdString() + "' (status " + std::to_string(status) + ")";
             return std::nullopt;
         }
         return value.toUtf8().toStdString();
     }
 
     bool remove(std::string_view namespaceName, std::string_view key) override {
+        lastError_.clear();
         auto wallet = openWallet();
         if (wallet == nullptr) {
             return false;
@@ -950,30 +968,53 @@ public:
         if (!prepareFolder(*wallet)) {
             return false;
         }
-        return wallet->removeEntry(QString::fromUtf8(accountName(namespaceName, key))) == 0;
+        const int status = wallet->removeEntry(QString::fromUtf8(accountName(namespaceName, key)));
+        if (status != 0) {
+            lastError_ = "KWallet removeEntry failed (status " + std::to_string(status) + ")";
+            return false;
+        }
+        return true;
     }
 
 private:
-    static std::unique_ptr<KWallet::Wallet> openWallet() {
+    std::unique_ptr<KWallet::Wallet> openWallet() {
         if (!QCoreApplication::instance()) {
+            lastError_ = "KWallet requires a QCoreApplication instance";
             return {};
         }
-        return std::unique_ptr<KWallet::Wallet>(
-            KWallet::Wallet::openWallet(KWallet::Wallet::NetworkWallet(), 0, KWallet::Wallet::Synchronous));
+        const auto walletName = KWallet::Wallet::NetworkWallet();
+        auto wallet = std::unique_ptr<KWallet::Wallet>(
+            KWallet::Wallet::openWallet(walletName, 0, KWallet::Wallet::Synchronous));
+        if (!wallet || !wallet->isOpen()) {
+            lastError_ = "KWallet could not open network wallet '" + walletName.toStdString()
+                + "' for application '" + QCoreApplication::applicationName().toStdString()
+                + "'; check wallet availability and application access permissions";
+            return {};
+        }
+        return wallet;
     }
 
-    static bool prepareFolder(KWallet::Wallet& wallet) {
+    bool prepareFolder(KWallet::Wallet& wallet) {
         const auto rootName = linuxVaultRootName();
         const QString folder = QString::fromUtf8(rootName.c_str());
         if (!wallet.hasFolder(folder) && !wallet.createFolder(folder)) {
+            lastError_ = "KWallet could not create folder '" + rootName
+                + "' in wallet '" + wallet.walletName().toStdString() + "'";
             return false;
         }
-        return wallet.setFolder(folder);
+        if (!wallet.setFolder(folder)) {
+            lastError_ = "KWallet could not select folder '" + rootName
+                + "' in wallet '" + wallet.walletName().toStdString() + "'";
+            return false;
+        }
+        return true;
     }
 
     static QByteArray accountName(std::string_view namespaceName, std::string_view key) {
         return QByteArray::fromStdString(toString(namespaceName) + "/" + toString(key));
     }
+
+    std::string lastError_;
 };
 #endif
 
