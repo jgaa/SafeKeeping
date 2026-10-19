@@ -17,8 +17,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 #include <sqlite3.h>
 #include <sodium.h>
@@ -34,6 +41,8 @@
 #include <libsecret/secret.h>
 #if defined(SAFEKEEPING_ENABLE_KWALLET)
 #include <QCoreApplication>
+#include <QEventLoop>
+#include <QTimer>
 #include <QString>
 #include <KF6/KWallet/kwallet.h>
 #endif
@@ -54,7 +63,8 @@ CREATE TABLE IF NOT EXISTS metadata (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     namespace_name TEXT NOT NULL,
-    system_vault_backend TEXT
+    system_vault_backend TEXT,
+    system_vault_entry TEXT
 );
 
 CREATE TABLE IF NOT EXISTS key_slots (
@@ -85,7 +95,7 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 )sql";
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 constexpr std::string_view kDbFileName = "vault.db";
 constexpr std::string_view kVaultEntryName = "namespace-vault-material";
 constexpr std::string_view kSlotStatusActive = "active";
@@ -290,7 +300,8 @@ void ensureSodium() {
 void validateNamespaceOrSecretName(std::string_view name, std::string_view label) {
     static const std::regex validName{R"(^[A-Za-z0-9_.-]{1,128}$)"};
 
-    if (!std::regex_match(name.begin(), name.end(), validName)) {
+    if (!std::regex_match(name.begin(), name.end(), validName) || name == "." || name == ".."
+        || (label == "namespace" && name == ".locks")) {
         fail(SafeKeeping::Error::InvalidArgument,
              toString(label) + " must match [A-Za-z0-9_.-]{1,128}");
     }
@@ -410,6 +421,82 @@ void lockDownPath(const std::filesystem::path& path, bool directory) {
 void ensurePrivateDirectory(const std::filesystem::path& path) {
     std::filesystem::create_directories(path);
     lockDownPath(path, true);
+}
+
+// Keep lock files outside namespaces, and never unlink them: all processes must
+// lock the same inode even while a namespace is being removed or created.
+class NamespaceLock {
+public:
+    explicit NamespaceLock(std::string_view name) {
+        const auto directory = baseDataPath() / ".locks";
+        ensurePrivateDirectory(directory);
+        const auto path = directory / (toString(name) + ".lock");
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        OVERLAPPED overlap{};
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("could not open namespace lock");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        while (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlap)) {
+            if (GetLastError() != ERROR_LOCK_VIOLATION || std::chrono::steady_clock::now() >= deadline) {
+                CloseHandle(handle_);
+                throw std::runtime_error("namespace '" + toString(name) + "' is busy or its lock is unavailable");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+#else
+        fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd_ == -1) {
+            throw std::runtime_error("could not open namespace lock");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        while (flock(fd_, LOCK_EX | LOCK_NB) == -1) {
+            if ((errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN)
+                || std::chrono::steady_clock::now() >= deadline) {
+                ::close(fd_);
+                throw std::runtime_error("namespace '" + toString(name) + "' is busy or its lock is unavailable");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+#endif
+    }
+    ~NamespaceLock() {
+#ifdef _WIN32
+        CloseHandle(handle_);
+#else
+        ::close(fd_);
+#endif
+    }
+    NamespaceLock(const NamespaceLock&) = delete;
+    NamespaceLock& operator=(const NamespaceLock&) = delete;
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
+// Reserve the database exclusively before SQLite opens it. SQLite's CREATE
+// flag alone also accepts an existing database.
+void reserveDatabase(const std::filesystem::path& path) {
+#ifdef _WIN32
+    auto handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("could not exclusively create namespace database");
+    }
+    CloseHandle(handle);
+#else
+    const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd == -1) {
+        throw std::runtime_error("could not exclusively create namespace database");
+    }
+    ::close(fd);
+#endif
 }
 
 void lockDownDatabaseArtifacts(const std::filesystem::path& dbPath) {
@@ -712,6 +799,11 @@ void migrateSchema(sqlite3* db) {
         changed = true;
     }
 
+    if (!metadataHasColumn(db, "system_vault_entry")) {
+        execute(db, "ALTER TABLE metadata ADD COLUMN system_vault_entry TEXT");
+        changed = true;
+    }
+
     if (schemaVersion < kSchemaVersion || changed) {
         auto update = prepare(db, "UPDATE metadata SET schema_version = ?, updated_at = ?");
         bindInt64(update.get(), 1, kSchemaVersion);
@@ -749,6 +841,56 @@ void setStoredSystemVaultBackend(sqlite3* db, std::optional<std::string_view> ba
     }
     bindInt64(stmt.get(), 2, nowSeconds());
     stepDone(db, stmt.get());
+}
+
+// NULL identifies legacy databases, whose existing wallet entry is preserved.
+std::string storedSystemVaultEntry(sqlite3* db) {
+    auto stmt = prepare(db, "SELECT system_vault_entry FROM metadata LIMIT 1");
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW || sqlite3_column_type(stmt.get(), 0) == SQLITE_NULL) {
+        return toString(kVaultEntryName);
+    }
+    const auto entry = columnText(stmt.get(), 0);
+    if (entry.empty()) {
+        throw std::runtime_error("system vault entry identifier is empty");
+    }
+    return entry;
+}
+
+void setStoredSystemVaultEntry(sqlite3* db, std::string_view entry) {
+    auto stmt = prepare(db, "UPDATE metadata SET system_vault_entry = ?, updated_at = ?");
+    bindText(stmt.get(), 1, entry);
+    bindInt64(stmt.get(), 2, nowSeconds());
+    stepDone(db, stmt.get());
+}
+
+std::string vaultContext(const VaultBackend& backend, std::string_view name, std::string_view entry) {
+    return "backend '" + backend.name() + "', namespace '" + toString(name)
+        + "', entry '" + toString(entry) + "'";
+}
+
+void validateVaultMaterial(const std::optional<std::string>& material,
+                           const VaultBackend& backend, std::string_view name, std::string_view entry) {
+    const auto context = vaultContext(backend, name, entry);
+    if (!material.has_value()) {
+        fail(SafeKeeping::Error::VaultError, "unable to read system vault material (" + context
+             + "): " + backend.lastErrorMessage());
+    }
+    if (material->size() != 64 || !std::all_of(material->begin(), material->end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        })) {
+        fail(SafeKeeping::Error::VaultError, "invalid system vault material: expected 64 hexadecimal characters, received "
+             + std::to_string(material->size()) + " bytes (" + context + "): " + backend.lastErrorMessage());
+    }
+}
+
+void refuseExistingLegacyEntry(VaultBackend& backend, std::string_view name) {
+    if (backend.load(name, kVaultEntryName).has_value()) {
+        fail(SafeKeeping::Error::VaultError, "refusing to create namespace while a legacy wallet entry exists ("
+             + vaultContext(backend, name, kVaultEntryName) + ")");
+    }
+    if (!backend.lastErrorMessage().empty()) {
+        fail(SafeKeeping::Error::VaultError, "unable to check legacy wallet entry: " + backend.lastErrorMessage());
+    }
 }
 
 class FileVaultBackend final : public VaultBackend {
@@ -807,6 +949,8 @@ class LibSecretVaultBackend final : public VaultBackend {
 public:
     std::string name() const override { return "libsecret"; }
 
+    std::string lastErrorMessage() const override { return lastError_; }
+
     bool available() const override {
         return !envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT");
     }
@@ -829,12 +973,14 @@ public:
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
+            lastError_ = error->message;
             g_error_free(error);
         }
         return ok != FALSE;
     }
 
     std::optional<std::string> load(std::string_view namespaceName, std::string_view key) override {
+        lastError_.clear();
         if (envFlagEnabled("SAFEKEEPING_DISABLE_SYSTEM_VAULT")) {
             return std::nullopt;
         }
@@ -849,6 +995,7 @@ public:
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
+            lastError_ = error->message;
             g_error_free(error);
         }
         if (secret == nullptr) {
@@ -874,12 +1021,14 @@ public:
             "account", account.c_str(),
             nullptr);
         if (error != nullptr) {
+            lastError_ = error->message;
             g_error_free(error);
         }
         return ok != FALSE;
     }
 
 private:
+    std::string lastError_;
     static SecretSchema& schema() {
         static SecretSchema schemaValue = {
             "SafeKeepingSchema",
@@ -943,12 +1092,26 @@ public:
         if (wallet == nullptr) {
             return std::nullopt;
         }
-        if (!prepareFolder(*wallet)) {
+        const auto folder = QString::fromStdString(linuxVaultRootName());
+        if (!wallet->hasFolder(folder)) {
+            return std::nullopt;
+        }
+        if (!wallet->setFolder(folder)) {
+            lastError_ = "KWallet could not select folder '" + folder.toStdString() + "'";
             return std::nullopt;
         }
 
         QString value;
         const auto entry = QString::fromUtf8(accountName(namespaceName, key));
+        if (!wallet->hasEntry(entry)) {
+            return std::nullopt;
+        }
+        const auto context = "wallet '" + wallet->walletName().toStdString()
+            + "', folder '" + wallet->currentFolder().toStdString() + "'";
+        if (wallet->entryType(entry) != KWallet::Wallet::Password) {
+            lastError_ = "KWallet entry has unexpected type in " + context;
+            return std::nullopt;
+        }
         const int status = wallet->readPassword(entry, value);
         if (status != 0) {
             lastError_ = "KWallet readPassword failed for wallet '" + wallet->walletName().toStdString()
@@ -956,7 +1119,13 @@ public:
                 + "', entry '" + entry.toStdString() + "' (status " + std::to_string(status) + ")";
             return std::nullopt;
         }
-        return value.toUtf8().toStdString();
+        const auto result = value.toUtf8().toStdString();
+        if (result.size() != 64 || !std::all_of(result.begin(), result.end(), [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            })) {
+            lastError_ = "KWallet returned invalid material from " + context;
+        }
+        return result;
     }
 
     bool remove(std::string_view namespaceName, std::string_view key) override {
@@ -983,9 +1152,24 @@ private:
             return {};
         }
         const auto walletName = KWallet::Wallet::NetworkWallet();
+        // KWallet's synchronous open blocks D-Bus until the user answers the
+        // password prompt. Wait for the async result while servicing GUI events.
         auto wallet = std::unique_ptr<KWallet::Wallet>(
-            KWallet::Wallet::openWallet(walletName, 0, KWallet::Wallet::Synchronous));
-        if (!wallet || !wallet->isOpen()) {
+            KWallet::Wallet::openWallet(walletName, 0, KWallet::Wallet::Asynchronous));
+        bool opened = wallet && wallet->isOpen();
+        if (wallet && !opened) {
+            QEventLoop loop;
+            QTimer timeout;
+            timeout.setSingleShot(true);
+            QObject::connect(wallet.get(), &KWallet::Wallet::walletOpened, &loop, [&](bool success) {
+                opened = success;
+                loop.quit();
+            });
+            QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+            timeout.start(60000);
+            loop.exec();
+        }
+        if (!wallet || !opened || !wallet->isOpen()) {
             lastError_ = "KWallet could not open network wallet '" + walletName.toStdString()
                 + "' for application '" + QCoreApplication::applicationName().toStdString()
                 + "'; check wallet availability and application access permissions";
@@ -1440,6 +1624,7 @@ void initializeSchema(sqlite3* db, std::string_view namespaceName) {
 }
 
 void validateSchema(sqlite3* db, std::string_view namespaceName) {
+    Transaction migration(db);
     migrateSchema(db);
     auto stmt = prepare(db, "SELECT schema_version, namespace_name FROM metadata LIMIT 1");
     if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
@@ -1451,6 +1636,7 @@ void validateSchema(sqlite3* db, std::string_view namespaceName) {
     if (columnText(stmt.get(), 1) != namespaceName) {
         throw std::runtime_error("namespace metadata mismatch");
     }
+    migration.commit();
 }
 
 sqlite_ptr openDatabase(const std::filesystem::path& dbPath, bool createIfMissing) {
@@ -1477,6 +1663,21 @@ sqlite_ptr openDatabase(const std::filesystem::path& dbPath, bool createIfMissin
     return db;
 }
 
+void verifyStoredVaultMaterial(sqlite3* db, VaultBackend& backend, std::string_view name,
+                               std::string_view entry, const bytes& expectedDek) {
+    const auto readBack = backend.load(name, entry);
+    validateVaultMaterial(readBack, backend, name, entry);
+    try {
+        if (unwrapDek(readSingleSlot(db, kSlotTypeVault), deriveVaultKek(*readBack), "schema-1") == expectedDek) {
+            return;
+        }
+    } catch (const std::exception&) {
+        // A valid-looking but incorrect read must also fail initialization.
+    }
+    fail(SafeKeeping::Error::VaultError, "stored system vault material failed key verification ("
+         + vaultContext(backend, name, entry) + ")");
+}
+
 } // namespace
 
 class SafeKeeping::Impl {
@@ -1496,10 +1697,14 @@ public:
         lock();
     }
 
-    static CreateResult createNew(std::string namespaceName, const CreateOptions& options) {
+    static CreateResult createNew(std::string namespaceName, const CreateOptions& options, bool openExisting = false) {
         validateNamespaceOrSecretName(namespaceName, "namespace");
+        NamespaceLock creationLock(namespaceName);
         const auto dbPath = databasePath(namespaceName);
         if (std::filesystem::exists(dbPath)) {
+            if (openExisting) {
+                return {.instance = open(namespaceName, UnlockOptions{}, true), .recoveryKey = std::nullopt};
+            }
             throw std::runtime_error("namespace already exists");
         }
 
@@ -1513,15 +1718,35 @@ public:
 
         const bytes dek = randomBytes(crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
         std::optional<std::string> recoveryKeyString;
+        const std::string entry = "namespace-vault-material-" + bytesToHex(randomBytes(16));
+        bool ownsDatabase = false;
+        bool ownsDirectory = false;
+        bool attemptedWalletWrite = false;
+        bool committed = false;
 
         try {
-            auto db = openDatabase(dbPath, true);
+            if (options.createSystemVaultSlot && vaultAvailable) {
+                refuseExistingLegacyEntry(*vaultBackendSelection.backend, namespaceName);
+            }
+            ownsDirectory = std::filesystem::create_directory(dbPath.parent_path());
+            lockDownPath(dbPath.parent_path(), true);
+            for (const auto& suffix : {"-wal", "-shm", "-journal"}) {
+                if (std::filesystem::symlink_status(dbPath.string() + suffix).type()
+                    != std::filesystem::file_type::not_found) {
+                    throw std::runtime_error("refusing to replace pre-existing database artifacts");
+                }
+            }
+            reserveDatabase(dbPath);
+            ownsDatabase = true;
+            auto db = openDatabase(dbPath, false);
             Transaction txn(db.get());
             initializeSchema(db.get(), namespaceName);
+            setStoredSystemVaultEntry(db.get(), entry);
 
             if (options.createSystemVaultSlot && vaultAvailable) {
                 const std::string vaultMaterial = bytesToHex(randomBytes(32));
-                if (!vaultBackendSelection.backend->store(namespaceName, kVaultEntryName, vaultMaterial)) {
+                attemptedWalletWrite = true;
+                if (!vaultBackendSelection.backend->store(namespaceName, entry, vaultMaterial)) {
                     const std::string detail = vaultBackendSelection.backend->lastErrorMessage();
                     throw std::runtime_error(
                         detail.empty() ? "failed to store vault material"
@@ -1537,6 +1762,7 @@ public:
                                             std::nullopt,
                                             0,
                                             0));
+                verifyStoredVaultMaterial(db.get(), *vaultBackendSelection.backend, namespaceName, entry, dek);
                 setStoredSystemVaultBackend(db.get(), vaultBackendSelection.backendName);
             }
 
@@ -1582,6 +1808,7 @@ public:
             }
 
             txn.commit();
+            committed = true;
             lockDownDatabaseArtifacts(dbPath);
 
             auto impl = std::make_unique<Impl>(namespaceName,
@@ -1595,16 +1822,29 @@ public:
                     .recoveryKey = recoveryKeyString};
         } catch (...) {
             std::error_code ignored;
-            if (vaultAvailable) {
-                vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+            if (!committed) {
+                if (attemptedWalletWrite && vaultBackendSelection.backend) {
+                    try { vaultBackendSelection.backend->remove(namespaceName, entry); } catch (...) {}
+                }
+                if (ownsDatabase) {
+                    for (const auto& suffix : {"", "-wal", "-shm", "-journal"}) {
+                        std::filesystem::remove(dbPath.string() + suffix, ignored);
+                    }
+                }
+                if (ownsDirectory) {
+                    std::filesystem::remove(dbPath.parent_path(), ignored); // only if empty
+                }
             }
-            std::filesystem::remove_all(dbPath.parent_path(), ignored);
             throw;
         }
     }
 
-    static std::unique_ptr<SafeKeeping> open(std::string namespaceName, const UnlockOptions& options) {
+    static std::unique_ptr<SafeKeeping> open(std::string namespaceName, const UnlockOptions& options, bool lockHeld = false) {
         validateNamespaceOrSecretName(namespaceName, "namespace");
+        std::unique_ptr<NamespaceLock> lock;
+        if (!lockHeld) {
+            lock = std::make_unique<NamespaceLock>(namespaceName);
+        }
         const auto dbPath = databasePath(namespaceName);
         if (!std::filesystem::exists(dbPath)) {
             return nullptr;
@@ -1639,15 +1879,17 @@ public:
 
     static bool removeNamespace(std::string namespaceName) {
         validateNamespaceOrSecretName(namespaceName, "namespace");
+        NamespaceLock lock(namespaceName);
         const auto dbPath = databasePath(namespaceName);
         const bool dbExists = std::filesystem::exists(dbPath);
         if (dbExists) {
             auto db = openDatabase(dbPath, false);
             validateSchema(db.get(), namespaceName);
+            const auto entry = storedSystemVaultEntry(db.get());
             if (const auto pinnedBackend = storedSystemVaultBackend(db.get()); pinnedBackend.has_value()) {
                 auto vaultBackendSelection = makeVaultBackend(pinnedBackend);
                 if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
-                    vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                    vaultBackendSelection.backend->remove(namespaceName, entry);
                 }
             } else {
 #if defined(__linux__) || defined(__unix__)
@@ -1658,13 +1900,13 @@ public:
                 }) {
                     auto vaultBackendSelection = makeVaultBackend(backendName);
                     if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
-                        vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                        vaultBackendSelection.backend->remove(namespaceName, entry);
                     }
                 }
 #else
                 auto vaultBackendSelection = makeVaultBackend();
                 if (vaultBackendSelection.backend != nullptr && vaultBackendSelection.backend->available()) {
-                    vaultBackendSelection.backend->remove(namespaceName, kVaultEntryName);
+                    vaultBackendSelection.backend->remove(namespaceName, entry);
                 }
 #endif
             }
@@ -1697,7 +1939,8 @@ public:
             fail(Error::VaultError, "system vault backend is not available");
         }
 
-        auto material = vaultBackend_->load(namespaceName_, kVaultEntryName);
+        const auto entry = storedSystemVaultEntry(db_.get());
+        auto material = vaultBackend_->load(namespaceName_, entry);
 #if defined(__linux__) || defined(__unix__)
         if (!material.has_value() &&
             !storedSystemVaultBackend(db_.get()).has_value() &&
@@ -1715,7 +1958,7 @@ public:
                     !fallbackBackendSelection.backend->available()) {
                     continue;
                 }
-                material = fallbackBackendSelection.backend->load(namespaceName_, kVaultEntryName);
+                material = fallbackBackendSelection.backend->load(namespaceName_, entry);
                 if (material.has_value()) {
                     vaultBackend_ = std::move(fallbackBackendSelection.backend);
                     vaultBackendName_ = std::move(fallbackBackendSelection.backendName);
@@ -1724,9 +1967,7 @@ public:
             }
         }
 #endif
-        if (!material.has_value()) {
-            fail(Error::VaultError, "failed to load namespace material from the system vault");
-        }
+        validateVaultMaterial(material, *vaultBackend_, namespaceName_, entry);
 
         try {
             const auto slot = readSingleSlot(db_.get(), kSlotTypeVault);
@@ -1986,40 +2227,32 @@ public:
 
     bool addSystemVaultSlot() {
         requireUnlocked();
+        Transaction txn(db_.get());
         if (hasSystemVaultSlot()) {
             fail(Error::AlreadyExists, "system vault slot already exists");
         }
         if (vaultBackend_ == nullptr || !vaultBackend_->available()) {
             fail(Error::VaultError, "system vault backend is not available");
         }
-
-        const std::string material = bytesToHex(randomBytes(32));
-        if (!vaultBackend_->store(namespaceName_, kVaultEntryName, material)) {
-            const std::string detail = vaultBackend_->lastErrorMessage();
-            fail(Error::VaultError,
-                 detail.empty() ? "failed to store namespace material in the system vault"
-                                : "failed to store namespace material in the system vault: " + detail);
+        // A fresh entry also avoids reusing an orphan left by a removed slot.
+        refuseExistingLegacyEntry(*vaultBackend_, namespaceName_);
+        const auto entry = "namespace-vault-material-" + bytesToHex(randomBytes(16));
+        const auto material = bytesToHex(randomBytes(32));
+        try {
+            if (!vaultBackend_->store(namespaceName_, entry, material)) {
+                fail(Error::VaultError, "failed to store namespace material ("
+                     + vaultContext(*vaultBackend_, namespaceName_, entry) + "): " + vaultBackend_->lastErrorMessage());
+            }
+            insertSlot(db_.get(), buildWrappedSlot("vault", "vault", dek_, deriveVaultKek(material),
+                                                  std::nullopt, std::nullopt, 0, 0));
+            verifyStoredVaultMaterial(db_.get(), *vaultBackend_, namespaceName_, entry, dek_);
+            setStoredSystemVaultEntry(db_.get(), entry);
+            setStoredSystemVaultBackend(db_.get(), vaultBackendName_);
+            txn.commit();
+        } catch (...) {
+            try { vaultBackend_->remove(namespaceName_, entry); } catch (...) {}
+            throw;
         }
-
-        Transaction txn(db_.get());
-        insertSlot(db_.get(),
-                   buildWrappedSlot("vault",
-                                    "vault",
-                                    dek_,
-                                    deriveVaultKek(material),
-                                    std::nullopt,
-                                    std::nullopt,
-                                    0,
-                                    0));
-#if defined(__linux__) || defined(__unix__)
-        if (!vaultBackendName_.has_value()) {
-            fail(Error::VaultError, "system vault backend is not available");
-        }
-        setStoredSystemVaultBackend(db_.get(), vaultBackendName_);
-#else
-        updateMetadataTimestamp();
-#endif
-        txn.commit();
         return true;
     }
 
@@ -2257,10 +2490,7 @@ std::unique_ptr<SafeKeeping> SafeKeeping::openOrCreate(std::string namespaceName
 
 std::unique_ptr<SafeKeeping> SafeKeeping::openOrCreate(std::string namespaceName,
                                                        CreateOptions options) {
-    if (exists(namespaceName)) {
-        return open(std::move(namespaceName));
-    }
-    return createNew(std::move(namespaceName), std::move(options)).instance;
+    return Impl::createNew(std::move(namespaceName), options, true).instance;
 }
 
 void SafeKeeping::setLinuxVaultRootName(std::string name) {

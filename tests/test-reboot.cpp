@@ -11,11 +11,38 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 #include <sqlite3.h>
 
 #include "safekeeping/SafeKeeping.h"
+
+#ifdef SAFEKEEPING_WRAP_SQLITE_STEP
+namespace {
+std::string corruptWalletRoot;
+std::optional<std::string> corruptWalletRead;
+}
+extern "C" int __real_sqlite3_step(sqlite3_stmt*);
+extern "C" int __wrap_sqlite3_step(sqlite3_stmt* stmt) {
+    const int status = __real_sqlite3_step(stmt);
+    const char* sql = sqlite3_sql(stmt);
+    if (status == SQLITE_DONE && !corruptWalletRoot.empty() && sql &&
+        std::string_view(sql).find("INSERT INTO key_slots") != std::string_view::npos) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(corruptWalletRoot)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".txt") {
+                if (corruptWalletRead) {
+                    std::ofstream out(entry.path(), std::ios::trunc);
+                    out << *corruptWalletRead;
+                } else {
+                    std::filesystem::remove(entry.path());
+                }
+            }
+        }
+    }
+    return status;
+}
+#endif
 
 namespace fs = std::filesystem;
 using jgaa::safekeeping::SafeKeeping;
@@ -523,7 +550,7 @@ TEST(SafeKeepingAcceptance, RealSystemVaultEntryIsStoredWithExpectedMetadata) {
 
     const std::string namespaceName = uniqueName("real_wallet");
     const std::string expectedRoot = SafeKeeping::linuxVaultRootName();
-    const std::string expectedEntry = namespaceName + "/namespace-vault-material";
+    std::string expectedEntry;
 
     auto cleanup = [&]() {
         SafeKeeping::removeNamespace(namespaceName);
@@ -541,6 +568,7 @@ TEST(SafeKeepingAcceptance, RealSystemVaultEntryIsStoredWithExpectedMetadata) {
     auto created = SafeKeeping::createNew(namespaceName, options);
     ASSERT_NE(created.instance, nullptr);
     ASSERT_TRUE(created.instance->hasSystemVaultSlot());
+    expectedEntry = namespaceName + "/" + *querySingleText(namespaceDbPath(root, namespaceName), "SELECT system_vault_entry FROM metadata");
     ASSERT_TRUE(created.instance->lock());
 
     auto reopened = SafeKeeping::open(namespaceName);
@@ -572,3 +600,176 @@ TEST(SafeKeepingAcceptance, RealSystemVaultEntryIsStoredWithExpectedMetadata) {
     }
 }
 #endif
+
+TEST_F(SafeKeepingRebootTest, InvalidWalletMaterialIsVaultErrorAndDoesNotChangeData) {
+    const auto created = SafeKeeping::createNew("invalid_material");
+    const auto entry = *querySingleText(namespaceDbPath(root_, "invalid_material"), "SELECT system_vault_entry FROM metadata");
+    const auto key = vaultRoot_ / "invalid_material" / (entry + ".txt");
+    std::ifstream input(key);
+    const std::string original((std::istreambuf_iterator<char>(input)), {});
+    input.close();
+    for (const auto& bad : {std::string{}, std::string("abc"), std::string(64, 'g')}) {
+        { std::ofstream out(key, std::ios::trunc); out << bad; }
+        auto reopened = SafeKeeping::open("invalid_material");
+        ASSERT_NE(reopened, nullptr);
+        EXPECT_FALSE(reopened->isUnlocked());
+        EXPECT_EQ(reopened->latestError().error, SafeKeeping::Error::VaultError);
+        EXPECT_NE(reopened->latestError().message.find("64 hexadecimal"), std::string::npos);
+        EXPECT_NE(reopened->latestError().message.find("backend 'file'"), std::string::npos);
+        EXPECT_NE(reopened->latestError().message.find(entry), std::string::npos);
+    }
+    { std::ofstream out(key, std::ios::trunc); out << original; }
+    EXPECT_TRUE(SafeKeeping::open("invalid_material")->isUnlocked());
+}
+
+TEST_F(SafeKeepingRebootTest, SeparateDataRootsUseIndependentWalletEntries) {
+    auto first = SafeKeeping::createNew("same_name");
+    first.instance.reset();
+    const auto firstEntry = querySingleText(namespaceDbPath(root_, "same_name"), "SELECT system_vault_entry FROM metadata");
+    const auto secondRoot = root_ / "second-data-root";
+    setEnvVar("SAFEKEEPING_DATA_DIR", secondRoot);
+    auto second = SafeKeeping::createNew("same_name");
+    second.instance.reset();
+    EXPECT_NE(firstEntry, querySingleText(namespaceDbPath(secondRoot, "same_name"), "SELECT system_vault_entry FROM metadata"));
+    EXPECT_TRUE(SafeKeeping::open("same_name")->isUnlocked());
+    EXPECT_TRUE(SafeKeeping::removeNamespace("same_name"));
+    setEnvVar("SAFEKEEPING_DATA_DIR", root_);
+    EXPECT_TRUE(SafeKeeping::open("same_name")->isUnlocked());
+}
+
+TEST_F(SafeKeepingRebootTest, CreationFailureBeforeWritePreservesExistingWalletAndFiles) {
+    auto first = SafeKeeping::createNew("failed_create");
+    first.instance.reset();
+    const auto secondRoot = root_ / "blocked-root";
+    fs::create_directories(secondRoot);
+    { std::ofstream out(secondRoot / "failed_create"); out << "must survive"; }
+    setEnvVar("SAFEKEEPING_DATA_DIR", secondRoot);
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = false;
+    options.passphrase = "pw";
+    EXPECT_THROW(SafeKeeping::createNew("failed_create", options), std::exception);
+    EXPECT_TRUE(fs::is_regular_file(secondRoot / "failed_create"));
+    setEnvVar("SAFEKEEPING_DATA_DIR", root_);
+    EXPECT_TRUE(SafeKeeping::open("failed_create")->isUnlocked());
+}
+
+TEST_F(SafeKeepingRebootTest, RollbackPreservesUnrelatedNamespaceFiles) {
+    const auto dir = root_ / "partial";
+    fs::create_directories(dir);
+    { std::ofstream out(dir / "unrelated"); out << "must survive"; }
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = false;
+    EXPECT_THROW(SafeKeeping::createNew("partial", options), std::exception);
+    EXPECT_TRUE(fs::exists(dir / "unrelated"));
+    EXPECT_FALSE(fs::exists(dir / "vault.db"));
+}
+
+TEST_F(SafeKeepingRebootTest, LegacyEntryIsPreservedAndBlocksNewDatabaseCreation) {
+    auto created = SafeKeeping::createNew("legacy_entry");
+    created.instance.reset();
+    const auto db = namespaceDbPath(root_, "legacy_entry");
+    const auto entry = *querySingleText(db, "SELECT system_vault_entry FROM metadata");
+    fs::rename(vaultRoot_ / "legacy_entry" / (entry + ".txt"),
+               vaultRoot_ / "legacy_entry" / "namespace-vault-material.txt");
+    execSql(db, "ALTER TABLE metadata DROP COLUMN system_vault_entry; UPDATE metadata SET schema_version=2;");
+    EXPECT_TRUE(SafeKeeping::open("legacy_entry")->isUnlocked());
+    const auto secondRoot = root_ / "new-root";
+    setEnvVar("SAFEKEEPING_DATA_DIR", secondRoot);
+    EXPECT_THROW(SafeKeeping::createNew("legacy_entry"), std::exception);
+    EXPECT_FALSE(fs::exists(namespaceDbPath(secondRoot, "legacy_entry")));
+    setEnvVar("SAFEKEEPING_DATA_DIR", root_);
+    EXPECT_TRUE(SafeKeeping::open("legacy_entry")->isUnlocked());
+    EXPECT_TRUE(SafeKeeping::removeNamespace("legacy_entry"));
+    EXPECT_FALSE(fs::exists(vaultRoot_ / "legacy_entry" / "namespace-vault-material.txt"));
+}
+
+#ifndef _WIN32
+TEST_F(SafeKeepingRebootTest, ConcurrentCreatorsPreserveWinningDatabaseAndKey) {
+    for (bool openOrCreate : {false, true}) {
+        const std::string name = openOrCreate ? "concurrent_open_or_create" : "concurrent_create";
+        int gate[2];
+        ASSERT_EQ(pipe(gate), 0);
+        std::vector<pid_t> children;
+        for (int i = 0; i < 8; ++i) {
+            const auto pid = fork();
+            ASSERT_NE(pid, -1);
+            if (pid == 0) {
+                close(gate[1]);
+                char token;
+                if (read(gate[0], &token, 1) != 1) _exit(3);
+                int result = 0;
+                try {
+                    auto vault = openOrCreate ? SafeKeeping::openOrCreate(name) : SafeKeeping::createNew(name).instance;
+                    result = vault && vault->isUnlocked() ? 0 : 3;
+                } catch (...) { result = 2; }
+                _exit(result);
+            }
+            children.push_back(pid);
+        }
+        close(gate[0]);
+        ASSERT_EQ(write(gate[1], "12345678", 8), 8);
+        close(gate[1]);
+        int successes = 0;
+        for (auto pid : children) {
+            int status = 0;
+            ASSERT_EQ(waitpid(pid, &status, 0), pid);
+            ASSERT_TRUE(WIFEXITED(status));
+            const int code = WEXITSTATUS(status);
+            EXPECT_TRUE(code == 0 || (!openOrCreate && code == 2));
+            successes += code == 0;
+        }
+        EXPECT_EQ(successes, openOrCreate ? 8 : 1);
+        EXPECT_TRUE(SafeKeeping::open(name)->isUnlocked());
+    }
+}
+#endif
+
+#ifdef SAFEKEEPING_WRAP_SQLITE_STEP
+TEST_F(SafeKeepingRebootTest, NewMaterialMustReadBackAndAuthenticateBeforeCreationSucceeds) {
+    int i = 0;
+    for (const auto& bad : {std::optional<std::string>{}, std::optional<std::string>{""},
+                           std::optional<std::string>{std::string(64, '0')}}) {
+        corruptWalletRoot = vaultRoot_.string();
+        corruptWalletRead = bad;
+        const auto name = "readback_failure_" + std::to_string(i++);
+        EXPECT_THROW(SafeKeeping::createNew(name), std::exception);
+        corruptWalletRoot.clear();
+        EXPECT_FALSE(SafeKeeping::exists(name));
+        if (fs::exists(vaultRoot_ / name)) EXPECT_TRUE(fs::is_empty(vaultRoot_ / name));
+    }
+}
+
+TEST_F(SafeKeepingRebootTest, AddingVaultSlotAlsoVerifiesReadBackAndRollsBack) {
+    SafeKeeping::CreateOptions options;
+    options.createSystemVaultSlot = false;
+    options.passphrase = "pw";
+    auto created = SafeKeeping::createNew("add_readback", options);
+    corruptWalletRoot = vaultRoot_.string();
+    corruptWalletRead = std::string(64, '0');
+    EXPECT_FALSE(created.instance->addSystemVaultSlot());
+    corruptWalletRoot.clear();
+    EXPECT_EQ(created.instance->latestError().error, SafeKeeping::Error::VaultError);
+    EXPECT_FALSE(created.instance->hasSystemVaultSlot());
+    EXPECT_TRUE(created.instance->lock());
+    EXPECT_TRUE(created.instance->unlockWithPassphrase("pw"));
+}
+#endif
+
+TEST_F(SafeKeepingRebootTest, CreationPreservesPreExistingDatabaseArtifacts) {
+    const auto dir = root_ / "orphan_artifact";
+    fs::create_directories(dir);
+    { std::ofstream out(dir / "vault.db-wal"); out << "must survive"; }
+    EXPECT_THROW(SafeKeeping::createNew("orphan_artifact"), std::exception);
+    EXPECT_FALSE(fs::exists(dir / "vault.db"));
+    std::ifstream input(dir / "vault.db-wal");
+    const std::string content((std::istreambuf_iterator<char>(input)), {});
+    EXPECT_EQ(content, "must survive");
+    EXPECT_FALSE(fs::exists(vaultRoot_ / "orphan_artifact"));
+}
+
+TEST_F(SafeKeepingRebootTest, NamespaceCannotAliasParentOrLockDirectory) {
+    for (const auto& name : {".", "..", ".locks"}) {
+        EXPECT_THROW(SafeKeeping::createNew(name), std::exception);
+        EXPECT_THROW(SafeKeeping::removeNamespace(name), std::exception);
+    }
+}

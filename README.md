@@ -276,3 +276,11 @@ See [include/safekeeping/SafeKeeping.h](/home/jgaa/src/SafeKeeping/include/safek
 * At least one active unlock slot must remain.
 * If the vault material is lost, the passphrase or recovery key can still unlock the namespace.
 * If all unlock methods are lost, the data is unrecoverable by design.
+
+### Wallet entry identity and creation safety
+
+New databases use schema version 3 with a random persistent `system_vault_entry` in metadata. Different data directories using the same namespace receive independent wallet entries. Existing version 1/2 databases migrate transactionally and retain their legacy `namespace-vault-material` entry. A new database refuses initialization if that legacy entry already exists. Back up the database before upgrading; older library versions cannot open schema 3.
+
+Namespace creation, opening, and removal use a process lock in the data directory's `.locks` directory. Lock files must not be removed while applications are running. Failed creation removes only the new database artifacts and the unique wallet entry belonging to that attempt, preserving unrelated files and previously existing vaults.
+
+System wallet material must contain exactly 64 hexadecimal characters. Missing, empty, or malformed responses report `VaultError` without attempting decryption. New system wallet slots are read back and authenticated against the database key before initialization succeeds. This detects immediate storage/read failures, but cannot guarantee persistence across reboot.
